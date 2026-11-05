@@ -118,6 +118,19 @@ TEST(ReorderDepGraph, BarrierIsOrderedAgainstEverything)
     EXPECT_FALSE(g.hasEdge(0, 2));
 }
 
+TEST(ReorderDepGraph, AuipcBarrierBlocksEverythingEvenNonConflictingRegs)
+{
+    // auipc writes a register like a normal instruction, so without the barrier
+    // check running first, this could look like a plain producer with no edge
+    // to the unrelated addi x1 before it. It must still be ordered against
+    // everything, because its value depends on its own address in the block.
+    const uint32_t auipcX5 = (5 << 7) | 0x17;    // auipc x5, 0
+    auto g = graphOf({addi(1, 0, 1), auipcX5, addi(2, 0, 2)});
+    EXPECT_TRUE(g.hasEdge(0, 1));
+    EXPECT_TRUE(g.hasEdge(1, 2));
+    EXPECT_FALSE(g.hasEdge(0, 2));   // same transitive-only pattern as the ecall case
+}
+
 TEST(ReorderDepGraph, PredAndSuccAgree)
 {
     auto g = graphOf({addi(1, 0, 1), addi(2, 1, 1), add(3, 1, 2), sw(3, 10, 0)});
