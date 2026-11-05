@@ -5,7 +5,7 @@ option(VM_DEBUG_PRINTS "Enable debug prints in VM during tests" OFF)
 option(ENABLE_COVERAGE "Enable coverage instrumentation for tests" OFF)
 
 file(GLOB_RECURSE TEST_FILES CONFIGURE_DEPENDS "*.cpp")
-
+list(FILTER TEST_FILES EXCLUDE REGEX "/build/|/CMakeFiles/")
 add_executable(kites_test
     ${TEST_FILES}
 )
