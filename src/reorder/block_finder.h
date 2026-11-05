@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "common/assembled_program.h"
 #include "reorder/decoded_inst.h"
 
 namespace Kites::reorder
@@ -31,7 +32,14 @@ inline int32_t jalImm(uint32_t w)
     return static_cast<int32_t>(imm << 11) >> 11;
 }
 
-inline std::vector<Block> findBlocks(const std::vector<uint32_t> &words)
+// extraLeaders: instruction indices that must start a new block even though
+// nothing in `words` points at them. We need this because a jalr's target
+// isn't in its bits (it comes from a register at run time), so a label that
+// is only ever reached through a jalr is invisible to the scan below. The
+// caller supplies those from the symbol table -- see labelLeaders() -- so
+// the block boundary is still safe even though we can't compute it here.
+inline std::vector<Block> findBlocks(const std::vector<uint32_t> &words,
+                                     const std::vector<size_t> &extraLeaders = {})
 {
     const size_t n = words.size();
     std::vector<Block> blocks;
@@ -43,6 +51,10 @@ inline std::vector<Block> findBlocks(const std::vector<uint32_t> &words)
     std::vector<bool> leader(n + 1, false);
     leader[0] = true;
     leader[n] = true;
+
+    for (size_t idx : extraLeaders)
+        if (idx < n)
+            leader[idx] = true;
 
     for (size_t i = 0; i < n; ++i)
     {
@@ -81,6 +93,24 @@ inline std::vector<Block> findBlocks(const std::vector<uint32_t> &words)
         begin = i;
     }
     return blocks;
+}
+
+// Every code label the assembler recorded, converted to an instruction index,
+// so it can be passed as findBlocks()'s extraLeaders. A jalr can jump to any
+// label (the assembler doesn't know which one, and neither do we), so the
+// only safe choice is to treat every label as a possible jalr target.
+// Data labels (isData) don't bound code and are skipped.
+inline std::vector<size_t> labelLeaders(const Kites::AssembledProgram &program)
+{
+    std::vector<size_t> leaders;
+    for (const auto &[name, sym] : program.symbol_table)
+    {
+        (void)name;
+        if (sym.isData || sym.address % 4 != 0)
+            continue;
+        leaders.push_back(static_cast<size_t>(sym.address / 4));
+    }
+    return leaders;
 }
 
 } // namespace Kites::reorder
