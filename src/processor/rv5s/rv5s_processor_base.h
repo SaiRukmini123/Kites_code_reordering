@@ -65,6 +65,14 @@ class RV5StageVM_Base : public ProcessorBase
     void memory_writeback_double();
 
     void register_write_back(const uint64_t &write_data);
+
+    // AUIPC: PC of the instruction plus the sign-extended upper immediate. The ALU path
+    // cannot produce this (its inputs are rs1/rs2, which for AUIPC are immediate bits).
+    uint64_t auipc_result() const
+    {
+        int32_t upper = static_cast<int32_t>(static_cast<uint32_t>(id_ex_reg_.imm) << 12);
+        return id_ex_reg_.pc + static_cast<uint64_t>(static_cast<int64_t>(upper));
+    }
     void memory_read();
     // void memory_read_float();
     // void memory_read_double();

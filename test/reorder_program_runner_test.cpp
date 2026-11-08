@@ -5,6 +5,8 @@
 #include "assembler/assembler.h"
 #include "processor/rv5s/rv5s_processor_h_f.h"
 #include "processor/rv5s/rv5s_processor_h_nf.h"
+#include "processor/rv5s/rv5s_processor_nh_f.h"
+#include "processor/rv5s/rv5s_processor_nh_nf.h"
 #include "reorder/program_runner.h"
 #include "utils/utils.h"
 
@@ -48,7 +50,8 @@ TEST(ReorderProgramRunner, StoreIsVisibleInDataWindow)
                                 "sw x6, 0(x5)\n");
     auto hf = runProgram<RV5StageProcessorHF>(program, {}, 5000);
     ASSERT_FALSE(hf.dataWords.empty());
-    EXPECT_EQ(hf.dataWords[0], 123u);   // if this fails: stores are not reaching readWord_d (cache not flushed)
+    EXPECT_EQ(hf.regs[5], vm_config::config.getDataSectionStart()); // la must point at buf
+    EXPECT_EQ(hf.dataWords[0], 123u);
 }
 
 // C: swapping in the same words must change nothing.
@@ -62,7 +65,8 @@ TEST(ReorderProgramRunner, IdentityWithTextIsEquivalent)
     EXPECT_TRUE(sameState(a, b));
     EXPECT_EQ(a.cycles, b.cycles);
 }
-TEST(ReorderProgramRunner, DiagnoseStoreVisibility)
+// D: a store then load through the cached path agrees with the direct path the runner reads.
+TEST(ReorderProgramRunner, StoreAndLoadAgreeWithDataWindow)
 {
     auto program = assembleText(".data\n"
                                 "buf: .word 0\n"
@@ -71,18 +75,25 @@ TEST(ReorderProgramRunner, DiagnoseStoreVisibility)
                                 "addi x6, x0, 123\n"
                                 "sw x6, 0(x5)\n"
                                 "lw x7, 0(x5)\n");
-    reorder_detail::CoutSilencer silence;
-    auto vm = std::make_unique<Steppable<RV5StageProcessorHF>>();
-    vm->LoadProgram(program);
-    while (vm->cycle_s_ < 5000 && vm->StepAndNotify())
-    {
-    }
-    uint64_t dataStart = vm_config::config.getDataSectionStart();
-    std::cerr << "[DIAG] dataStart=" << dataStart
-              << " x5(addr of buf)=" << vm->registers_.ReadGpr(5)
-              << " x6=" << vm->registers_.ReadGpr(6)
-              << " x7(loaded back)=" << vm->registers_.ReadGpr(7)
-              << " readWord(cached path)=" << vm->memory_controller_.readWord(dataStart)
-              << " readWord_d(direct path)=" << vm->memory_controller_.readWord_d(dataStart)
-              << std::endl;
+    auto hf = runProgram<RV5StageProcessorHF>(program, {}, 5000);
+    EXPECT_EQ(hf.regs[7], 123u);
+    EXPECT_EQ(hf.dataWords[0], 123u);
 }
+
+// E: AUIPC adds the sign-extended upper immediate to its own PC, on every pipeline variant.
+template <class VM> void expectAuipc()
+{
+    auto program = assembleText("addi x1, x0, 1\n"
+                                "auipc x5, 0x10000\n"  // pc=4 -> 0x10000004
+                                "auipc x6, 0x80000\n"  // pc=8, bit 31 set -> sign-extended
+                                "auipc x7, 0\n");      // pc=12 -> 12
+    auto r = runProgram<VM>(program, {}, 5000);
+    ASSERT_FALSE(r.hitCap);
+    EXPECT_EQ(r.regs[5], 0x10000004ull);
+    EXPECT_EQ(r.regs[6], 0xFFFFFFFF80000008ull);
+    EXPECT_EQ(r.regs[7], 12ull);
+}
+TEST(ReorderProgramRunner, AuipcHF) { expectAuipc<RV5StageProcessorHF>(); }
+TEST(ReorderProgramRunner, AuipcHNF) { expectAuipc<RV5StageProcessorHNF>(); }
+TEST(ReorderProgramRunner, AuipcNHF) { expectAuipc<RV5StageProcessorNHF>(); }
+TEST(ReorderProgramRunner, AuipcNHNF) { expectAuipc<RV5StageProcessorNHNF>(); }
