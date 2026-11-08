@@ -163,10 +163,18 @@ struct Move
     size_t newIndex = 0;
 };
 
+struct BlockStalls
+{
+    Block block{};
+    int stallsBefore = 0;
+    int stallsAfter = 0;
+};
+
 struct ScheduleReport
 {
     std::vector<uint32_t> words;
     std::vector<Move> moves;       // only instructions whose index actually changed
+    std::vector<BlockStalls> blocks;
     int stallsBefore = 0;
     int stallsAfter = 0;
 };
@@ -227,7 +235,10 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             originalInsts.push_back(decode(words[k]));
         }
-        report.stallsBefore += predictStalls(originalInsts, kind, originalCtx);
+        BlockStalls blockStalls;
+        blockStalls.block = block;
+        blockStalls.stallsBefore = predictStalls(originalInsts, kind, originalCtx);
+        report.stallsBefore += blockStalls.stallsBefore;
 
         std::vector<size_t> order = scheduleBlock(words, block, kind, scheduledCtx, memDisambiguation);
         std::vector<uint32_t> newBlockWords = materializeBlockOrder(words, block, order);
@@ -250,7 +261,9 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             scheduledInsts.push_back(decode(w));
         }
-        report.stallsAfter += predictStalls(scheduledInsts, kind, scheduledCtx);
+        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, scheduledCtx);
+        report.stallsAfter += blockStalls.stallsAfter;
+        report.blocks.push_back(blockStalls);
 
         if (!scheduledInsts.empty())
         {
