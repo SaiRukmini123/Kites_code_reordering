@@ -42,7 +42,8 @@ inline std::vector<int> criticalPathLengths(const DepGraph &g)
 // STRICTLY better than the original order by predictStalls, the identity
 // permutation is returned instead -- scheduleBlock never makes a block worse.
 inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, const Block &block,
-                                          PipelineKind kind, HeadContext ctx = {})
+                                          PipelineKind kind, HeadContext ctx = {},
+                                          bool memDisambiguation = true)
 {
     const size_t n = block.end - block.begin;
     std::vector<size_t> identity(n);
@@ -52,7 +53,7 @@ inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, con
         return identity;
     }
 
-    DepGraph g = buildDepGraph(words, block);
+    DepGraph g = buildDepGraph(words, block, memDisambiguation);
     std::vector<int> cp = criticalPathLengths(g);
 
     std::vector<DecodedInst> insts;
@@ -162,10 +163,18 @@ struct Move
     size_t newIndex = 0;
 };
 
+struct BlockStalls
+{
+    Block block{};
+    int stallsBefore = 0;
+    int stallsAfter = 0;
+};
+
 struct ScheduleReport
 {
     std::vector<uint32_t> words;
     std::vector<Move> moves;       // only instructions whose index actually changed
+    std::vector<BlockStalls> blocks;
     int stallsBefore = 0;
     int stallsAfter = 0;
 };
@@ -184,7 +193,8 @@ struct ScheduleReport
 // (instructions_retired_, total_stalls_, final registers and memory) is the
 // final judge of correctness and benefit, not this prediction.
 inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, PipelineKind kind,
-                                       const std::vector<size_t> &extraLeaders = {})
+                                       const std::vector<size_t> &extraLeaders = {},
+                                       bool memDisambiguation = true)
 {
     ScheduleReport report;
     report.words.reserve(words.size());
@@ -225,9 +235,12 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             originalInsts.push_back(decode(words[k]));
         }
-        report.stallsBefore += predictStalls(originalInsts, kind, originalCtx);
+        BlockStalls blockStalls;
+        blockStalls.block = block;
+        blockStalls.stallsBefore = predictStalls(originalInsts, kind, originalCtx);
+        report.stallsBefore += blockStalls.stallsBefore;
 
-        std::vector<size_t> order = scheduleBlock(words, block, kind, scheduledCtx);
+        std::vector<size_t> order = scheduleBlock(words, block, kind, scheduledCtx, memDisambiguation);
         std::vector<uint32_t> newBlockWords = materializeBlockOrder(words, block, order);
 
         size_t outBase = report.words.size();
@@ -248,7 +261,9 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             scheduledInsts.push_back(decode(w));
         }
-        report.stallsAfter += predictStalls(scheduledInsts, kind, scheduledCtx);
+        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, scheduledCtx);
+        report.stallsAfter += blockStalls.stallsAfter;
+        report.blocks.push_back(blockStalls);
 
         if (!scheduledInsts.empty())
         {
