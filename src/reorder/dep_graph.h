@@ -68,7 +68,69 @@ inline bool mustStayAfter(const DecodedInst &earlier, const DecodedInst &later)
     return raw || war || waw || mem;
 }
 
-inline DepGraph buildDepGraph(const std::vector<uint32_t> &words, const Block &block)
+// True when mustStayAfter(earlier, later) is forced only by the conservative
+// memory clause -- no barrier and no true register dependency (RAW/WAR/WAW)
+// links them. Mirrors mustStayAfter's own sub-conditions so callers that
+// already know mustStayAfter is true can tell whether memory is the sole
+// reason, without re-deriving it differently.
+inline bool linkedOnlyByMemory(const DecodedInst &earlier, const DecodedInst &later)
+{
+    if (earlier.is_barrier || later.is_barrier)
+        return false;
+
+    const bool raw = writesReg(earlier) &&
+                     ((later.reads_rs1 && later.rs1 == earlier.rd) ||
+                      (later.reads_rs2 && later.rs2 == earlier.rd));
+    const bool war = writesReg(later) &&
+                     ((earlier.reads_rs1 && earlier.rs1 == later.rd) ||
+                      (earlier.reads_rs2 && earlier.rs2 == later.rd));
+    const bool waw = writesReg(earlier) && writesReg(later) && earlier.rd == later.rd;
+
+    return !raw && !war && !waw;
+}
+
+// Can the conservative memory edge between insts[i] and insts[j] (i < j,
+// both loads/stores, at least one a store) be dropped?
+//
+// Safe only when all of these hold:
+//  - both use the same base register (the raw rs1 bit field -- where both
+//    I-type loads and S-type stores always put their base);
+//  - that register is written by neither op itself (e.g. lw x5,0(x5), which
+//    would make the "same register" mean a different value depending on
+//    which of the two runs first) nor by anything strictly between them;
+//  - their byte ranges [offset, offset+size) don't overlap.
+//
+// Why this is safe to reorder: dropping this edge only lets the scheduler
+// swap these two memory ops relative to EACH OTHER. Any instruction that
+// writes the shared base register from outside this window is already
+// ordered against both i and j by an ordinary RAW/WAR edge on that same
+// register (ordinary dependency tracking, untouched by this function), so
+// it keeps producing the same base value before whichever of the two runs
+// first. Since nothing inside the window changes that value either, both
+// ops see the identical base value regardless of their relative order, so
+// their effective addresses -- and hence whether they truly conflict --
+// never depend on how the scheduler orders them.
+inline bool canDropMemoryEdge(const std::vector<DecodedInst> &insts, size_t i, size_t j)
+{
+    const DecodedInst &a = insts[i];
+    const DecodedInst &b = insts[j];
+    if (a.rs1 != b.rs1)
+        return false;
+
+    const uint8_t baseReg = a.rs1;
+    for (size_t k = i; k <= j; ++k)
+        if (writesReg(insts[k]) && insts[k].rd == baseReg)
+            return false;
+
+    const int64_t aStart = a.mem_offset, aEnd = aStart + a.mem_size;
+    const int64_t bStart = b.mem_offset, bEnd = bStart + b.mem_size;
+    return aEnd <= bStart || bEnd <= aStart;
+}
+
+// memDisambiguation = false restores the fully conservative memory rule
+// (every pair with a store keeps its order), for A/B comparison.
+inline DepGraph buildDepGraph(const std::vector<uint32_t> &words, const Block &block,
+                              bool memDisambiguation = true)
 {
     DepGraph g;
     g.size = block.end - block.begin;
@@ -82,11 +144,17 @@ inline DepGraph buildDepGraph(const std::vector<uint32_t> &words, const Block &b
 
     for (size_t i = 0; i < g.size; ++i)
         for (size_t j = i + 1; j < g.size; ++j)
-            if (mustStayAfter(insts[i], insts[j]))
-            {
-                g.succ[i].push_back(j);
-                g.pred[j].push_back(i);
-            }
+        {
+            if (!mustStayAfter(insts[i], insts[j]))
+                continue;
+
+            if (memDisambiguation && linkedOnlyByMemory(insts[i], insts[j]) &&
+                canDropMemoryEdge(insts, i, j))
+                continue;
+
+            g.succ[i].push_back(j);
+            g.pred[j].push_back(i);
+        }
     return g;
 }
 
