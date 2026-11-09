@@ -53,28 +53,25 @@ void report(const char *vmName, Observed &auipc, Observed &la)
 
 } // namespace
 
-// Asserts what Kites actually does today (this is a finding, not a fix):
-// the single-cycle RVSS VM is correct; both pipelined VMs leave auipc's
-// destination at 0, so la yields 0 and the load reads the program's own
-// first instruction word (auipc x10, 65536 = 0x10000517) from address 0.
-TEST(ReorderAuipcQuirk, ObservedResults)
+// This test first caught the bug: the single-cycle RVSS VM was correct, but
+// both pipelined VMs left auipc's destination at 0, so la yielded 0 and the
+// load read the program's own first instruction word (0x10000517) from
+// address 0. The rv5s pipelines were fixed in cd19afb; the test now guards
+// that fix by requiring the correct values on all three VMs.
+TEST(ReorderAuipcQuirk, CorrectOnAllThreeVms)
 {
     Observed hfAuipc, hfLa, hnfAuipc, hnfLa, ssAuipc, ssLa;
     report<Kites::RV5StageProcessorHF>("rv5s h_f ", hfAuipc, hfLa);
     report<Kites::RV5StageProcessorHNF>("rv5s h_nf", hnfAuipc, hnfLa);
     report<Kites::RVSSProcessor>("rvss     ", ssAuipc, ssLa);
 
-    EXPECT_EQ(ssAuipc.x10, 0x1004u);
-    EXPECT_EQ(ssLa.x10, 0x10000000u);
-    EXPECT_EQ(ssLa.x5, 1234u);
-
-    for (const Observed *o : {&hfAuipc, &hnfAuipc})
+    for (const Observed *o : {&hfAuipc, &hnfAuipc, &ssAuipc})
     {
-        EXPECT_EQ(o->x10, 0u);
+        EXPECT_EQ(o->x10, 0x1004u);
     }
-    for (const Observed *o : {&hfLa, &hnfLa})
+    for (const Observed *o : {&hfLa, &hnfLa, &ssLa})
     {
-        EXPECT_EQ(o->x10, 0u);
-        EXPECT_EQ(o->x5, 0x10000517u);
+        EXPECT_EQ(o->x10, 0x10000000u);
+        EXPECT_EQ(o->x5, 1234u);
     }
 }
