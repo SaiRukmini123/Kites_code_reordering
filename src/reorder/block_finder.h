@@ -76,7 +76,7 @@ inline std::vector<Block> findBlocks(const std::vector<uint32_t> &words,
                 }
             }
         }
-        else if (d.is_barrier)                          // ecall, auipc, unknown
+        else if (d.is_barrier)                          // ecall, unknown (auipc is pinned, not a barrier)
         {
             leader[i] = true;                           // barrier starts its own block
             leader[i + 1] = true;                       // and ends it

@@ -118,17 +118,23 @@ TEST(ReorderDepGraph, BarrierIsOrderedAgainstEverything)
     EXPECT_FALSE(g.hasEdge(0, 2));
 }
 
-TEST(ReorderDepGraph, AuipcBarrierBlocksEverythingEvenNonConflictingRegs)
+TEST(ReorderDepGraph, AuipcGetsOrdinaryEdgesOnly)
 {
-    // auipc writes a register like a normal instruction, so without the barrier
-    // check running first, this could look like a plain producer with no edge
-    // to the unrelated addi x1 before it. It must still be ordered against
-    // everything, because its value depends on its own address in the block.
-    const uint32_t auipcX5 = (5 << 7) | 0x17;    // auipc x5, 0
-    auto g = graphOf({addi(1, 0, 1), auipcX5, addi(2, 0, 2)});
-    EXPECT_TRUE(g.hasEdge(0, 1));
+    // auipc is pinned to its slot by the schedulers, not a barrier: it writes
+    // rd, reads nothing (its rs1/rs2 bits are immediate bits), and gets only
+    // the ordinary register edges.
+    const uint32_t auipcX5 = (5 << 7) | 0x17 | (0x12345u << 12);   // auipc x5, 0x12345
+    auto g = graphOf({addi(1, 0, 1),     // 0: unrelated
+                      add(6, 5, 0),      // 1: reads x5 before auipc writes it -> WAR
+                      auipcX5,           // 2
+                      addi(7, 5, 4),     // 3: reads x5 -> RAW
+                      addi(5, 0, 9)});   // 4: writes x5 -> WAW (and WAR with 3)
+    EXPECT_FALSE(g.hasEdge(0, 2));
     EXPECT_TRUE(g.hasEdge(1, 2));
-    EXPECT_FALSE(g.hasEdge(0, 2));   // same transitive-only pattern as the ecall case
+    EXPECT_TRUE(g.hasEdge(2, 3));
+    EXPECT_TRUE(g.hasEdge(2, 4));
+    EXPECT_EQ(g.pred[2].size(), 1u);
+    EXPECT_EQ(g.succ[2].size(), 2u);
 }
 
 TEST(ReorderDepGraph, PredAndSuccAgree)

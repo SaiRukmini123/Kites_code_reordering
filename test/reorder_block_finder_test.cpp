@@ -107,14 +107,24 @@ TEST(ReorderBlockFinder, JalrIsTerminatorAndBarrier)
     expectBlock(b[3], 4, 5, false);
 }
 
-// auipc is pinned to its address, so nothing may move across it in either direction.
-TEST(ReorderBlockFinder, AuipcIsIsolated)
+// auipc is pinned to its slot by the schedulers, not a barrier, so it no
+// longer starts or ends a block.
+TEST(ReorderBlockFinder, AuipcDoesNotSplitBlocks)
 {
-    auto b = findBlocks({addi(1, 0, 1), auipc(2, 0), addi(3, 0, 2)});
-    ASSERT_EQ(b.size(), 3u);
-    expectBlock(b[0], 0, 1, false);
-    expectBlock(b[1], 1, 2, false);  // auipc is a barrier, not a branch/jump, so hasTerminator is false
-    expectBlock(b[2], 2, 3, false);
+    auto b = findBlocks({addi(1, 0, 1), auipc(2, 0), addi(3, 0, 2), auipc(4, 1), addi(5, 4, 8)});
+    ASSERT_EQ(b.size(), 1u);
+    expectBlock(b[0], 0, 5, false);
+}
+
+TEST(ReorderBlockFinder, LaInTheMiddleOfABlock)
+{
+    std::istringstream source(".data\nv: .word 7\n.text\naddi x5, x0, 1\nla x10, v\nlw x6, 0(x10)\n"
+                              "add x7, x6, x5\n");
+    const Kites::AssembledProgram program = Kites::assemble(source);
+    ASSERT_EQ(program.text_buffer.size(), 5u);   // la = auipc + addi
+    auto b = findBlocks(program.text_buffer, labelLeaders(program));
+    ASSERT_EQ(b.size(), 1u);
+    expectBlock(b[0], 0, 5, false);
 }
 
 // A branch target outside the program must not crash and must not fabricate a leader.

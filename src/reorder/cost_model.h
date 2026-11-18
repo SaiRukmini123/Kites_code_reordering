@@ -91,50 +91,120 @@ inline int checkHazard(const Producer &cur, const Producer &prev,
 // VM in reorder_cost_model_test.cpp (ReorderCostModel.Exp1_* and Exp3_HNF are
 // the cases where a naive "nearest 2 real producers" model gets this wrong).
 //
-// The loop below reproduces that mechanism directly: a 2-slot producer
-// window that shifts once per simulated cycle, and a stall counter that is
-// decremented without re-checking while it drains, then re-checked (and
-// charged again if it still hazards) once it reaches zero.
+// issue() below reproduces that mechanism directly: a 2-slot producer
+// window that shifts once per simulated cycle; a hazard inserts that many
+// bubble cycles (each one shifting a bubble into the window, with no
+// re-check while it drains), and then the same instruction is re-checked
+// and charged again if it still hazards.
+//
+// The window between two instructions. After an instruction issues, these
+// two slots are everything the hazard check will ever read again (the stall
+// countdown is always 0 at that point), so the stalls charged to the rest of
+// a block depend only on this window and the instructions still to come.
+struct WindowState
+{
+    Producer older{};   // issued one cycle before `newer`, or a bubble if `newer` stalled first
+    Producer newer{};   // the instruction issued last
+};
+
+inline WindowState windowFrom(const HeadContext &ctx)
+{
+    WindowState w;
+    w.older = ctx.prev2 ? asProducer(*ctx.prev2) : Producer{};
+    w.newer = ctx.prev1 ? asProducer(*ctx.prev1) : Producer{};
+    return w;
+}
+
+// Issues one instruction from window `w`: returns the stall cycles charged
+// to it and leaves `w` as the window right after it issued.
+inline int issue(WindowState &w, const DecodedInst &consumer, PipelineKind kind)
+{
+    // pipeline_execute() runs every cycle regardless of stall state, and
+    // shifts the window using whatever is pending (a real instruction, or a
+    // NOP left behind by a stall).
+    Producer slotPrev = w.older;
+    Producer slotCur = w.newer;
+    int stalls = 0;
+    while (true)
+    {
+        const int hazard = checkHazard(slotCur, slotPrev, consumer.rs1, consumer.rs2, kind);
+        if (hazard == 0)
+        {
+            w.older = slotCur;
+            w.newer = asProducer(consumer);
+            return stalls;
+        }
+        stalls += hazard;
+        for (int cycle = 0; cycle < hazard; ++cycle)   // id_ex_reg_.reset(): a bubble each cycle
+        {
+            slotPrev = slotCur;
+            slotCur = Producer{};
+        }
+    }
+}
+
+// One way into a block: the hazard window it starts from, and how much its
+// stalls count (an edge weight; see block_entries.h).
+struct ScoredHead
+{
+    WindowState window{};
+    int weight = 1;
+};
+
+// What an order of one block is scored on:
+//   sum over heads h of  h.weight * (stalls of the block starting from h.window)
+//                      + tailWeight * (stalls of `tail` issued right after it)
+// `tail` is the first instructions of the block this one can fall through to
+// (empty if it can't). One head of weight 1 and no tail is plain
+// predictStalls() with that head's context.
+struct BlockScoring
+{
+    std::vector<ScoredHead> heads;
+    std::vector<DecodedInst> tail;
+    int tailWeight = 0;
+};
+
+inline BlockScoring singleContext(const HeadContext &ctx)
+{
+    BlockScoring s;
+    s.heads.push_back(ScoredHead{windowFrom(ctx), 1});
+    return s;
+}
+
+inline int scoreOrder(const std::vector<DecodedInst> &order, PipelineKind kind, const BlockScoring &scoring,
+                      bool withTail = true)
+{
+    int total = 0;
+    for (const ScoredHead &head : scoring.heads)
+    {
+        WindowState w = head.window;
+        int stalls = 0;
+        for (const DecodedInst &d : order)
+        {
+            stalls += issue(w, d, kind);
+        }
+        total += head.weight * stalls;
+        if (withTail)
+        {
+            int tailStalls = 0;
+            for (const DecodedInst &d : scoring.tail)
+            {
+                tailStalls += issue(w, d, kind);
+            }
+            total += scoring.tailWeight * tailStalls;
+        }
+    }
+    return total;
+}
+
 inline int predictStalls(const std::vector<DecodedInst> &block, PipelineKind kind,
                           HeadContext ctx = {})
 {
-    Producer slotCur = ctx.prev2 ? asProducer(*ctx.prev2) : Producer{};
-    Producer pending = ctx.prev1 ? asProducer(*ctx.prev1) : Producer{};
-    Producer slotPrev{};
-
-    int stallCyclesLeft = 0;
+    WindowState w = windowFrom(ctx);
     int totalStalls = 0;
-    size_t idx = 0;
-
-    while (idx < block.size())
+    for (const DecodedInst &consumer : block)
     {
-        // pipeline_execute() runs this cycle regardless of stall state, and
-        // shifts the window using whatever is pending (a real instruction,
-        // or a NOP left behind by a previous stall).
-        slotPrev = slotCur;
-        slotCur = pending;
-
-        if (stallCyclesLeft > 0)
-        {
-            --stallCyclesLeft;
-            ++totalStalls;
-            pending = Producer{};   // id_ex_reg_.reset(): still a bubble next cycle
-            continue;               // same consumer, not re-checked until the drain ends
-        }
-
-        const DecodedInst &consumer = block[idx];
-        int stalls = checkHazard(slotCur, slotPrev, consumer.rs1, consumer.rs2, kind);
-        if (stalls > 0)
-        {
-            ++totalStalls;
-            stallCyclesLeft = stalls - 1;
-            pending = Producer{};
-        }
-        else
-        {
-            pending = asProducer(consumer);
-            ++idx;
-        }
+        totalStalls += issue(w, consumer, kind);
     }
     return totalStalls;
 }
