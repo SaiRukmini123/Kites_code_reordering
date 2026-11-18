@@ -11,56 +11,66 @@
 
 ## rv5-h-f
 
-- programs tried: 54, improved: 28, unchanged: 26, slower: 0, not equivalent: 0
-- total cycles: 5465 -> 5315 (2.74% fewer)
-- with the keep-original rule (reordered kept only if equivalent and faster): 5465 -> 5315 (2.74% fewer), no program slower
-- overall CPI: 1.524 -> 1.483
-- mean cycle reduction per program: 5.22% (over all tried), 10.07% (over improved only)
+Scheduled with ScheduleMode::Optimal (block-entry scoring). "total cycles" is the raw reordered program; the safety-net line is what is kept.
+
+- programs tried: 54, improved: 29, unchanged: 25, slower: 0, not equivalent: 0
+- total cycles: 5465 -> 5313 (2.78% fewer)
+- after the VM safety net (applyWithVmCheck keeps a block's new order only if the program stays equivalent and gets no slower): 5465 -> 5313 (2.78% fewer); programs improved: 29, fell back to the original: 0, some blocks rejected: 0
+- overall CPI: 1.524 -> 1.482
+- mean cycle reduction per program: 5.36% (over all tried), 9.99% (over improved only)
 - max cycle reduction: 19.05% (hazard_byte_loads)
 
 | category | tried | improved | cycles before | cycles after | reduction |
 |---|---|---|---|---|---|
-| aliasing | 8 | 8 | 349 | 308 | 11.75% |
-| chain | 10 | 1 | 1859 | 1854 | 0.27% |
+| aliasing | 8 | 8 | 349 | 307 | 12.03% |
+| chain | 10 | 2 | 1859 | 1853 | 0.32% |
 | hazard | 17 | 10 | 305 | 283 | 7.21% |
 | loop | 10 | 6 | 1895 | 1821 | 3.91% |
 | mixed | 9 | 3 | 1057 | 1049 | 0.76% |
 
-Blocks with predicted stalls: 40 (stalls removed: 27, reduced: 1, not reduced: 12). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 0
+Block numbers below are the scheduler's block score (stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions); remaining stalls are classified only where the optimizer proved them optimal.
+
+Blocks with predicted stalls: 47 (stalls removed: 28, reduced: 2, not reduced: 17). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 0
 
 | reason | blocks not reduced | % | all blocks with stalls left | % |
 |---|---|---|---|---|
-| dependency_chain | 3 | 25.0% | 3 | 23.1% |
+| dependency_chain | 3 | 17.6% | 3 | 15.8% |
 | nothing_independent | 0 | 0.0% | 0 | 0.0% |
-| memory_ordering | 1 | 8.3% | 2 | 15.4% |
-| block_boundary | 8 | 66.7% | 8 | 61.5% |
+| memory_ordering | 0 | 0.0% | 1 | 5.3% |
+| block_boundary | 14 | 82.4% | 15 | 78.9% |
 | false_stall_immediate | 0 | 0.0% | 0 | 0.0% |
 | other_not_proven_optimal | 0 | 0.0% | 0 | 0.0% |
+| scheduler_missed_optimum | 0 | 0.0% | 0 | 0.0% |
 
 ## rv5-h-nf
 
-- programs tried: 54, improved: 47, unchanged: 6, slower: 1, not equivalent: 0
-- total cycles: 8249 -> 7179 (12.97% fewer)
-- with the keep-original rule (reordered kept only if equivalent and faster): 8249 -> 7173 (13.04% fewer), no program slower
-- overall CPI: 2.301 -> 2.003
-- mean cycle reduction per program: 13.92% (over all tried), 16.02% (over improved only)
+Scheduled with ScheduleMode::Optimal (block-entry scoring). "total cycles" is the raw reordered program; the safety-net line is what is kept.
+
+- programs tried: 54, improved: 51, unchanged: 3, slower: 0, not equivalent: 0
+- total cycles: 8249 -> 7016 (14.95% fewer)
+- after the VM safety net (applyWithVmCheck keeps a block's new order only if the program stays equivalent and gets no slower): 8249 -> 7016 (14.95% fewer); programs improved: 51, fell back to the original: 0, some blocks rejected: 0
+- overall CPI: 2.301 -> 1.957
+- mean cycle reduction per program: 15.46% (over all tried), 16.37% (over improved only)
 - max cycle reduction: 41.67% (ref_load_store_alu_mix)
 
 | category | tried | improved | cycles before | cycles after | reduction |
 |---|---|---|---|---|---|
-| aliasing | 8 | 8 | 539 | 440 | 18.37% |
-| chain | 10 | 7 | 2457 | 2387 | 2.85% |
+| aliasing | 8 | 8 | 539 | 438 | 18.74% |
+| chain | 10 | 10 | 2457 | 2353 | 4.23% |
 | hazard | 17 | 14 | 408 | 347 | 14.95% |
-| loop | 10 | 9 | 3047 | 2451 | 19.56% |
-| mixed | 9 | 9 | 1798 | 1554 | 13.57% |
+| loop | 10 | 10 | 3047 | 2362 | 22.48% |
+| mixed | 9 | 9 | 1798 | 1516 | 15.68% |
 
-Blocks with predicted stalls: 127 (stalls removed: 22, reduced: 63, not reduced: 42). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 8
+Block numbers below are the scheduler's block score (stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions); remaining stalls are classified only where the optimizer proved them optimal.
+
+Blocks with predicted stalls: 116 (stalls removed: 13, reduced: 73, not reduced: 30). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 2
 
 | reason | blocks not reduced | % | all blocks with stalls left | % |
 |---|---|---|---|---|
-| dependency_chain | 2 | 4.8% | 28 | 26.7% |
-| nothing_independent | 0 | 0.0% | 1 | 1.0% |
-| memory_ordering | 0 | 0.0% | 2 | 1.9% |
-| block_boundary | 39 | 92.9% | 49 | 46.7% |
+| dependency_chain | 4 | 13.3% | 53 | 51.5% |
+| nothing_independent | 1 | 3.3% | 5 | 4.9% |
+| memory_ordering | 0 | 0.0% | 1 | 1.0% |
+| block_boundary | 25 | 83.3% | 43 | 41.7% |
 | false_stall_immediate | 0 | 0.0% | 1 | 1.0% |
-| other_not_proven_optimal | 1 | 2.4% | 24 | 22.9% |
+| other_not_proven_optimal | 0 | 0.0% | 0 | 0.0% |
+| scheduler_missed_optimum | 0 | 0.0% | 0 | 0.0% |

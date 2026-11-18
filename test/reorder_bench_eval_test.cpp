@@ -143,6 +143,7 @@ TEST(ReorderBenchEval, ClassifiesBlockBoundary)
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
     EXPECT_EQ(b->status, "unimproved");
+    EXPECT_TRUE(b->proven);
     EXPECT_EQ(b->reason, StallReason::BlockBoundary);
 }
 
@@ -153,6 +154,10 @@ TEST(ReorderBenchEval, ClassifiesDependencyChain)
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
     EXPECT_EQ(b->stallsAfter, 6);
+    EXPECT_TRUE(b->searched);
+    EXPECT_TRUE(b->proven);
+    EXPECT_EQ(b->optimalStalls, 6);
+    EXPECT_EQ(b->greedyStalls, 6);
     EXPECT_EQ(b->reason, StallReason::DependencyChain);
 }
 
@@ -165,12 +170,13 @@ TEST(ReorderBenchEval, ClassifiesMemoryOrdering)
     auto blocks = classify("sw x6, 0(x11)\nlw x5, 0(x10)\nadd x7, x5, x5\n", PipelineKind::HF, seed);
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
+    EXPECT_TRUE(b->proven);
     EXPECT_EQ(b->reason, StallReason::MemoryOrdering);
 }
 
-// A free, independent filler is in the dependency graph, yet one stall is left. Without a search
-// over other orders the classifier does not claim the schedule is or is not optimal.
-TEST(ReorderBenchEval, ClassifiesNotProvenOptimal)
+// Proven path: two interleavable chains still leave a stall, and the optimizer proves no order
+// does better, so the reason comes from the dependency graph (not "not proven").
+TEST(ReorderBenchEval, ProvenOptimalBlockGetsGraphReason)
 {
     auto blocks = classify("addi x5, x0, 64\nadd x6, x5, x5\nadd x7, x6, x6\n"
                            "addi x11, x0, 32\nadd x12, x11, x11\nadd x13, x12, x12\n",
@@ -178,7 +184,94 @@ TEST(ReorderBenchEval, ClassifiesNotProvenOptimal)
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
     EXPECT_LT(b->stallsAfter, b->stallsBefore);
+    EXPECT_TRUE(b->proven);
+    EXPECT_EQ(b->method, reorder::OptimizerMethod::Optimal);
+    EXPECT_EQ(b->optimalStalls, b->stallsAfter);
+    EXPECT_NE(b->reason, StallReason::OtherNotProvenOptimal);
+    EXPECT_NE(b->reason, StallReason::SchedulerMissedOptimum);
+}
+
+// Not-proven path: a block over the optimizer's size limit is not searched, so its stalls are
+// not given a graph reason.
+TEST(ReorderBenchEval, BlockTooLargeToSearchIsNotProven)
+{
+    std::string source = "addi x5, x0, 1\n";
+    for (size_t i = 0; i < reorder::kMaxOptimalBlockSize + 5; ++i)
+    {
+        source += "add x5, x5, x5\n";
+    }
+    auto blocks = classify(source, PipelineKind::HNF, {});
+    const BlockOutcome *b = firstWithStallsLeft(blocks);
+    ASSERT_NE(b, nullptr);
+    EXPECT_GT(b->block.end - b->block.begin, reorder::kMaxOptimalBlockSize);
+    EXPECT_FALSE(b->proven);
+    EXPECT_EQ(b->method, reorder::OptimizerMethod::GreedyTooLarge);
     EXPECT_EQ(b->reason, StallReason::OtherNotProvenOptimal);
+}
+
+// A schedule that left an avoidable stall (here: the original order of load_use, as if the
+// scheduler had done nothing) is reported as scheduler_missed_optimum.
+TEST(ReorderBenchEval, ClassifiesSchedulerMissedOptimum)
+{
+    AssembledProgram program = hazard_bench::assembleHazardText(
+        "lw x5, 0(x10)\nadd x6, x5, x5\naddi x7, x0, 32\n");
+    ScheduleReport report = reorder::scheduleProgram(program.text_buffer, PipelineKind::HF,
+                                                     reorder::labelLeaders(program));
+    ASSERT_FALSE(report.moves.empty());
+    report.words = program.text_buffer; // pretend the scheduler kept the original order
+    report.moves.clear();
+    for (reorder::BlockStalls &bs : report.blocks)
+    {
+        bs.stallsAfter = bs.stallsBefore;
+    }
+    const std::vector<BlockOutcome> blocks = classifyBlocks(program, report, PipelineKind::HF);
+    const BlockOutcome *b = firstWithStallsLeft(blocks);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(b->stallsAfter, 1);
+    EXPECT_EQ(b->optimalStalls, 0);
+    EXPECT_EQ(b->reason, StallReason::SchedulerMissedOptimum);
+}
+
+// schedulerScoring() rebuilds the scoring scheduleProgram used; if it ever drifts from
+// scheduler.h, the optimizer would be asked a different question than the scheduler answered.
+TEST(ReorderBenchEval, RebuiltScoringMatchesScheduler)
+{
+    size_t blocksChecked = 0;
+    for (const auto &path : findPrograms("../bench/programs"))
+    {
+        const std::string source = readFile(path);
+        if (!assemblerHangLabel(source).empty())
+        {
+            continue;
+        }
+        SCOPED_TRACE(path.string());
+        AssembledProgram program = hazard_bench::assembleHazardText(source);
+        const std::vector<size_t> leaders = reorder::labelLeaders(program);
+        const auto blocks = reorder::findBlocks(program.text_buffer, leaders);
+        const auto entries = reorder::blockEntries(program.text_buffer, blocks, leaders);
+        for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
+        {
+            for (reorder::ScheduleMode mode : {reorder::ScheduleMode::Greedy, reorder::ScheduleMode::Optimal})
+            {
+                const ScheduleReport report =
+                    reorder::scheduleProgram(program.text_buffer, kind, leaders, true, mode);
+                ASSERT_EQ(report.blocks.size(), blocks.size());
+                for (size_t b = 0; b < blocks.size(); ++b)
+                {
+                    std::vector<reorder::DecodedInst> scheduled;
+                    for (size_t k = blocks[b].begin; k < blocks[b].end; ++k)
+                    {
+                        scheduled.push_back(reorder::decode(report.words[k]));
+                    }
+                    const auto scoring = schedulerScoring(program.text_buffer, report.words, blocks, entries, b);
+                    EXPECT_EQ(reorder::scoreOrder(scheduled, kind, scoring), report.blocks[b].stallsAfter)
+                        << "block " << b;
+                    ++blocksChecked;
+                }
+            }
+        }
+    }
+    EXPECT_GT(blocksChecked, 100u);
 }
 
 TEST(ReorderBenchEval, ReasonNames)
@@ -189,6 +282,7 @@ TEST(ReorderBenchEval, ReasonNames)
     EXPECT_STREQ(stallReasonName(StallReason::MemoryOrdering), "memory_ordering");
     EXPECT_STREQ(stallReasonName(StallReason::FalseStall), "false_stall_immediate");
     EXPECT_STREQ(stallReasonName(StallReason::OtherNotProvenOptimal), "other_not_proven_optimal");
+    EXPECT_STREQ(stallReasonName(StallReason::SchedulerMissedOptimum), "scheduler_missed_optimum");
 }
 
 TEST(ReorderBenchEval, CsvFieldsAreQuoted)
@@ -223,6 +317,11 @@ TEST(ReorderBenchEval, CommittedBenchmarkSet)
         EXPECT_TRUE(r.outcome.equivalent);
         EXPECT_FALSE(r.outcome.before.hitCap);
         EXPECT_EQ(r.outcome.before.retired, r.outcome.after.retired);
-        EXPECT_LE(keptCycles(r.outcome), r.outcome.before.cycles);
+        EXPECT_LE(r.keptCycles, r.outcome.before.cycles); // the safety net never makes it slower
+        for (const BlockOutcome &b : r.blocks)
+        {
+            // The batch schedules with the optimizer, so it can never miss the optimum.
+            EXPECT_NE(b.reason, StallReason::SchedulerMissedOptimum) << "block at line " << b.firstLine;
+        }
     }
 }
