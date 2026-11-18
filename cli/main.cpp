@@ -8,6 +8,7 @@
 #include "common/globals.h"
 #include "processor/processor_manager.h"
 #include "processor/processor_types.h"
+#include "reorder_command.h"
 #include "repl.h"
 #include "utils/utils.h"
 
@@ -34,7 +35,14 @@ void printUsage(const char *programName)
            "repeatable (batch mode only)\n"
         << "  --repl, -i      drop into the interactive REPL instead of auto-running;\n"
         << "                  if assembly-file is given it is loaded before the prompt\n"
-        << "  (running with no assembly-file also enters the REPL)\n";
+        << "  (running with no assembly-file also enters the REPL)\n"
+        << "       " << programName
+        << " reorder <file.s> --vm rv5-h-f|rv5-h-nf [--seed <spec>] [--html <out.html>]"
+           " [--out <reordered.s>]\n"
+        << "  reorder         schedule for the hazard pipeline, run original and reordered,\n"
+        << "                  and compare (see '" << programName << " reorder --help')\n"
+        << "       " << programName << " reorder-bench <programs-dir> [--out <dir>]\n"
+        << "  reorder-bench   validity filter + batch run, writes CSVs and a summary\n";
 }
 
 const std::unordered_map<std::string, Kites::ProcessorType> processorTypes = {
@@ -51,6 +59,15 @@ int main(int argc, char *argv[])
     QCoreApplication app(argc, argv);
 
     Kites::setupVmStateDirectory();
+
+    if (argc >= 2 && std::string(argv[1]) == "reorder")
+    {
+        return Kites::RunReorderCommand(argc, argv);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "reorder-bench")
+    {
+        return Kites::RunReorderBenchCommand(argc, argv);
+    }
 
     std::string assemblyFile;
     std::string processorTypeStr = "rvss";

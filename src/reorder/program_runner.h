@@ -27,6 +27,9 @@ struct RunResult
     std::vector<uint32_t> dataWords; // window from data start
     std::vector<uint32_t> stackWords;
     bool hitCap{};
+    // The text section still holds the program after the run (a store to a low address would
+    // overwrite instructions, since text starts at address 0 in the same memory).
+    bool textIntact{true};
 };
 
 namespace reorder_detail
@@ -95,6 +98,15 @@ RunResult runProgram(const AssembledProgram &prog, const Seed &seed, unsigned ca
         }
         if (!vm->StepAndNotify())
         {
+            break;
+        }
+    }
+    const uint64_t textStart = vm_config::config.getTextSectionStart();
+    for (size_t i = 0; i < prog.text_buffer.size(); ++i)
+    {
+        if (vm->memory_controller_.readWord_d(textStart + 4ull * i) != prog.text_buffer[i])
+        {
+            res.textIntact = false;
             break;
         }
     }
