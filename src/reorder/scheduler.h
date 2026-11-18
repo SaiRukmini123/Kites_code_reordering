@@ -412,6 +412,7 @@ struct BlockStalls
     // by a taken branch or jump, a call's return, or program start).
     // stallsBefore: the original order in the original program.
     // stallsAfter: the new order in the scheduled program.
+    // Predicted with the same HazardModel as the scores.
     int stallsBefore = 0;
     int stallsAfter = 0;
 
@@ -471,8 +472,9 @@ struct ScheduleReport
 // scoreBefore/scoreAfter hold that weighted score; stallsBefore/stallsAfter
 // hold plain predicted stalls (see BlockStalls).
 //
-// `model` chooses the hazard model used for scoring (HazardModel::Exact, the
-// default, is what the VM does; Textbook is for the quirk ablation).
+// `model` chooses the hazard model used for scoring and for the predicted
+// stall fields (HazardModel::Exact, the default, is what the VM does;
+// Textbook is for the quirk ablation).
 //
 // ContextMode::ArrayOrder is the previous behaviour: one context, the two
 // instructions immediately above in the WORD ARRAY, which is only an
@@ -574,7 +576,7 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
             const bool fallsIn = contexts == ContextMode::ArrayOrder || entries[b].fallThrough;
             return fallsIn ? fallThroughCtx : HeadContext{};
         };
-        blockStalls.stallsBefore = predictStalls(originalInsts, kind, plainContext(originalCtx));
+        blockStalls.stallsBefore = predictStalls(originalInsts, kind, plainContext(originalCtx), model);
         blockStalls.scoreBefore = scoreOrder(originalInsts, kind, originalScoring);
         report.stallsBefore += blockStalls.stallsBefore;
         report.scoreBefore += blockStalls.scoreBefore;
@@ -614,7 +616,7 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             scheduledInsts.push_back(decode(w));
         }
-        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, plainContext(scheduledCtx));
+        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, plainContext(scheduledCtx), model);
         blockStalls.scoreAfter = scoreOrder(scheduledInsts, kind, scheduledScoring);
         if (mode == ScheduleMode::Greedy)
         {
