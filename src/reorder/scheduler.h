@@ -452,6 +452,9 @@ struct ScheduleReport
 // is scored from an empty window. With loopWeight = 1 every weight is 1.
 // stallsBefore/stallsAfter then hold that weighted score.
 //
+// `model` chooses the hazard model used for scoring (HazardModel::Exact, the
+// default, is what the VM does; Textbook is for the quirk ablation).
+//
 // ContextMode::ArrayOrder is the previous behaviour: one context, the two
 // instructions immediately above in the WORD ARRAY, which is only an
 // approximation at branch targets. Either way the real VM measurement is the
@@ -461,7 +464,8 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
                                        bool memDisambiguation = true,
                                        ScheduleMode mode = ScheduleMode::Greedy,
                                        ContextMode contexts = ContextMode::BlockEntries,
-                                       int loopWeight = kDefaultLoopWeight)
+                                       int loopWeight = kDefaultLoopWeight,
+                                       HazardModel model = HazardModel::Exact)
 {
     ScheduleReport report;
     report.words.reserve(words.size());
@@ -512,10 +516,13 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             if (contexts == ContextMode::ArrayOrder)
             {
-                return singleContext(fallThroughCtx);
+                BlockScoring single = singleContext(fallThroughCtx);
+                single.model = model;
+                return single;
             }
             const BlockEntry &entry = entries[b];
             BlockScoring scoring;
+            scoring.model = model;
             if (entry.fallThrough)
             {
                 scoring.heads.push_back(ScoredHead{windowFrom(fallThroughCtx), entry.fallThroughWeight});
