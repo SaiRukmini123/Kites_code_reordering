@@ -13,6 +13,14 @@ namespace Kites::reorder
 // with the instruction 1 back (2 cycles) or 2 back (1 cycle).
 enum class PipelineKind : uint8_t { HF, HNF };
 
+// Which source registers the hazard check compares against producers.
+//  - Exact (default): what Kites' hazard unit does -- the rs1/rs2 bit fields
+//    of EVERY instruction, even when those bits are part of an immediate
+//    (the quirk). Matches the VM exactly on straight-line code.
+//  - Textbook: only registers the instruction really reads (reads_rs1 /
+//    reads_rs2), as a textbook pipeline would. For the quirk ablation only.
+enum class HazardModel : uint8_t { Exact, Textbook };
+
 // The two real instructions immediately before a block, used to seed the
 // predictor's state at the block's head (so a hazard crossing into the block
 // from outside can still be predicted).
@@ -117,8 +125,12 @@ inline WindowState windowFrom(const HeadContext &ctx)
 
 // Issues one instruction from window `w`: returns the stall cycles charged
 // to it and leaves `w` as the window right after it issued.
-inline int issue(WindowState &w, const DecodedInst &consumer, PipelineKind kind)
+inline int issue(WindowState &w, const DecodedInst &consumer, PipelineKind kind,
+                 HazardModel model = HazardModel::Exact)
 {
+    // Register 0 never matches a producer (asProducer only marks writes to rd != 0).
+    const uint8_t rs1 = (model == HazardModel::Exact || consumer.reads_rs1) ? consumer.rs1 : 0;
+    const uint8_t rs2 = (model == HazardModel::Exact || consumer.reads_rs2) ? consumer.rs2 : 0;
     // pipeline_execute() runs every cycle regardless of stall state, and
     // shifts the window using whatever is pending (a real instruction, or a
     // NOP left behind by a stall).
@@ -127,7 +139,7 @@ inline int issue(WindowState &w, const DecodedInst &consumer, PipelineKind kind)
     int stalls = 0;
     while (true)
     {
-        const int hazard = checkHazard(slotCur, slotPrev, consumer.rs1, consumer.rs2, kind);
+        const int hazard = checkHazard(slotCur, slotPrev, rs1, rs2, kind);
         if (hazard == 0)
         {
             w.older = slotCur;
@@ -162,6 +174,7 @@ struct BlockScoring
     std::vector<ScoredHead> heads;
     std::vector<DecodedInst> tail;
     int tailWeight = 0;
+    HazardModel model = HazardModel::Exact;
 };
 
 inline BlockScoring singleContext(const HeadContext &ctx)
@@ -181,7 +194,7 @@ inline int scoreOrder(const std::vector<DecodedInst> &order, PipelineKind kind, 
         int stalls = 0;
         for (const DecodedInst &d : order)
         {
-            stalls += issue(w, d, kind);
+            stalls += issue(w, d, kind, scoring.model);
         }
         total += head.weight * stalls;
         if (withTail)
@@ -189,7 +202,7 @@ inline int scoreOrder(const std::vector<DecodedInst> &order, PipelineKind kind, 
             int tailStalls = 0;
             for (const DecodedInst &d : scoring.tail)
             {
-                tailStalls += issue(w, d, kind);
+                tailStalls += issue(w, d, kind, scoring.model);
             }
             total += scoring.tailWeight * tailStalls;
         }
@@ -198,20 +211,21 @@ inline int scoreOrder(const std::vector<DecodedInst> &order, PipelineKind kind, 
 }
 
 inline int predictStalls(const std::vector<DecodedInst> &block, PipelineKind kind,
-                          HeadContext ctx = {})
+                          HeadContext ctx = {}, HazardModel model = HazardModel::Exact)
 {
     WindowState w = windowFrom(ctx);
     int totalStalls = 0;
     for (const DecodedInst &consumer : block)
     {
-        totalStalls += issue(w, consumer, kind);
+        totalStalls += issue(w, consumer, kind, model);
     }
     return totalStalls;
 }
 
 // Convenience overload for the scheduler: decode once, predict on the
 // resulting instructions.
-inline int predictStalls(const std::vector<uint32_t> &words, PipelineKind kind)
+inline int predictStalls(const std::vector<uint32_t> &words, PipelineKind kind,
+                          HazardModel model = HazardModel::Exact)
 {
     std::vector<DecodedInst> insts;
     insts.reserve(words.size());
@@ -219,7 +233,7 @@ inline int predictStalls(const std::vector<uint32_t> &words, PipelineKind kind)
     {
         insts.push_back(decode(w));
     }
-    return predictStalls(insts, kind);
+    return predictStalls(insts, kind, {}, model);
 }
 
 // Convenience overload for one block of a larger assembled program.
