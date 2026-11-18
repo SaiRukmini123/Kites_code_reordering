@@ -404,14 +404,30 @@ struct Move
 struct BlockStalls
 {
     Block block{};
+
+    // Plain predicted stalls of the block: no weights and no tail, from the
+    // one context the block is predicted with -- the two instructions above it
+    // if it can be entered by falling through from the block above (always, in
+    // ContextMode::ArrayOrder), otherwise an empty window (it is only reached
+    // by a taken branch or jump, a call's return, or program start).
+    // stallsBefore: the original order in the original program.
+    // stallsAfter: the new order in the scheduled program.
     int stallsBefore = 0;
     int stallsAfter = 0;
-    int greedyStalls = 0;      // greedy order's predicted stalls (same head context)
-    int optimalStalls = -1;    // ScheduleMode::Optimal only; -1 when not searched
+
+    // Scores, in the same units as scoreAfter (not plain stalls).
+    int greedyStalls = 0;      // greedy order's score
+    int optimalStalls = -1;    // ScheduleMode::Optimal only: the chosen order's score; -1 when not searched
     OptimizerMethod method = OptimizerMethod::NotSearched;
     uint64_t nodesSearched = 0;
     BlockEntry entry{};        // ContextMode::BlockEntries only: how the block can be entered
     int tailWeight = 0;        // ContextMode::BlockEntries only: weight of the tail term (0 = no tail)
+
+    // The weighted objective the scheduler minimizes (BlockScoring): each
+    // entry context's stalls times its edge weight, plus the weighted tail.
+    // In ContextMode::ArrayOrder it equals stallsBefore / stallsAfter.
+    int scoreBefore = 0;
+    int scoreAfter = 0;
 };
 
 enum class ScheduleMode : uint8_t
@@ -431,8 +447,10 @@ struct ScheduleReport
     std::vector<uint32_t> words;
     std::vector<Move> moves;       // only instructions whose index actually changed
     std::vector<BlockStalls> blocks;
-    int stallsBefore = 0;
-    int stallsAfter = 0;
+    int stallsBefore = 0;   // sum of BlockStalls::stallsBefore (plain predicted stalls)
+    int stallsAfter = 0;    // sum of BlockStalls::stallsAfter
+    int scoreBefore = 0;    // sum of BlockStalls::scoreBefore (weighted objective)
+    int scoreAfter = 0;     // sum of BlockStalls::scoreAfter
 };
 
 // Applies scheduleBlock (or the optimal search) to every block found via
@@ -450,7 +468,8 @@ struct ScheduleReport
 // their original order; that block isn't scheduled yet) are added, weighted
 // by that fall-through edge. A block that can't be entered at all (dead code)
 // is scored from an empty window. With loopWeight = 1 every weight is 1.
-// stallsBefore/stallsAfter then hold that weighted score.
+// scoreBefore/scoreAfter hold that weighted score; stallsBefore/stallsAfter
+// hold plain predicted stalls (see BlockStalls).
 //
 // `model` chooses the hazard model used for scoring (HazardModel::Exact, the
 // default, is what the VM does; Textbook is for the quirk ablation).
@@ -549,8 +568,16 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
             blockStalls.entry = entries[b];
             blockStalls.tailWeight = scheduledScoring.tailWeight;
         }
-        blockStalls.stallsBefore = scoreOrder(originalInsts, kind, originalScoring);
+        // The one context plain stalls are predicted with (see BlockStalls).
+        auto plainContext = [&](const HeadContext &fallThroughCtx)
+        {
+            const bool fallsIn = contexts == ContextMode::ArrayOrder || entries[b].fallThrough;
+            return fallsIn ? fallThroughCtx : HeadContext{};
+        };
+        blockStalls.stallsBefore = predictStalls(originalInsts, kind, plainContext(originalCtx));
+        blockStalls.scoreBefore = scoreOrder(originalInsts, kind, originalScoring);
         report.stallsBefore += blockStalls.stallsBefore;
+        report.scoreBefore += blockStalls.scoreBefore;
 
         std::vector<size_t> order;
         if (mode == ScheduleMode::Optimal)
@@ -587,12 +614,14 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             scheduledInsts.push_back(decode(w));
         }
-        blockStalls.stallsAfter = scoreOrder(scheduledInsts, kind, scheduledScoring);
+        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, plainContext(scheduledCtx));
+        blockStalls.scoreAfter = scoreOrder(scheduledInsts, kind, scheduledScoring);
         if (mode == ScheduleMode::Greedy)
         {
-            blockStalls.greedyStalls = blockStalls.stallsAfter;
+            blockStalls.greedyStalls = blockStalls.scoreAfter;
         }
         report.stallsAfter += blockStalls.stallsAfter;
+        report.scoreAfter += blockStalls.scoreAfter;
         report.blocks.push_back(blockStalls);
 
         if (!scheduledInsts.empty())
@@ -631,8 +660,10 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
     return report;
 }
 
-// Greedy-vs-optimal totals of a ScheduleMode::Optimal report. Each block's
-// greedy and optimal numbers use the same head context.
+// Greedy-vs-optimal totals of a ScheduleMode::Optimal report, in score units
+// (BlockStalls::greedyStalls and scoreAfter; the optimizer's objective, which
+// equals plain stalls only in ContextMode::ArrayOrder). Each block's greedy
+// and optimal numbers use the same scoring.
 struct OptimalSummary
 {
     int greedyStalls = 0;
@@ -656,12 +687,12 @@ inline OptimalSummary summarizeOptimal(const ScheduleReport &report)
     {
         ++s.blocks;
         s.greedyStalls += b.greedyStalls;
-        s.optimalStalls += b.stallsAfter;
+        s.optimalStalls += b.scoreAfter;
         s.nodesSearched += b.nodesSearched;
         const bool proven = b.method == OptimizerMethod::Optimal || b.method == OptimizerMethod::GreedyAlreadyZero;
         s.provenBlocks += proven ? 1 : 0;
-        s.greedyAlreadyOptimal += (proven && b.stallsAfter == b.greedyStalls) ? 1 : 0;
-        s.improvedBlocks += (b.stallsAfter < b.greedyStalls) ? 1 : 0;
+        s.greedyAlreadyOptimal += (proven && b.scoreAfter == b.greedyStalls) ? 1 : 0;
+        s.improvedBlocks += (b.scoreAfter < b.greedyStalls) ? 1 : 0;
         s.bestFoundBlocks += (b.method == OptimizerMethod::BestFound) ? 1 : 0;
         s.capHitBlocks += (b.method == OptimizerMethod::GreedyCapHit) ? 1 : 0;
         s.tooLargeBlocks += (b.method == OptimizerMethod::GreedyTooLarge) ? 1 : 0;

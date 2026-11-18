@@ -218,7 +218,122 @@ TEST(ReorderBoundary, WeightOneIsThePlainSum)
             for (const DecodedInst &d : insts) plain += issue(*w, d, kind);
             plain += issue(*w, decode(words[loop.end]), kind);   // tail: the one instruction after the loop
         }
-        EXPECT_EQ(r.blocks[1].stallsBefore, plain) << pipelineName(kind);
+        EXPECT_EQ(r.blocks[1].scoreBefore, plain) << pipelineName(kind);
+    }
+}
+
+// =======================================================================
+// What the report fields hold. stallsBefore/stallsAfter are plain predicted
+// stalls (what Saanvi's classifier and CSVs read): no weights, no tail, each
+// block once from the one context it is predicted with -- the two words
+// above it if it can be entered by falling through, otherwise an empty
+// window. scoreBefore/scoreAfter hold the weighted objective.
+// =======================================================================
+
+namespace
+{
+
+HeadContext contextAbove(const std::vector<uint32_t> &words, size_t begin, DecodedInst &prev1, DecodedInst &prev2)
+{
+    HeadContext ctx;
+    if (begin >= 1)
+    {
+        prev1 = decode(words[begin - 1]);
+        ctx.prev1 = &prev1;
+    }
+    if (begin >= 2)
+    {
+        prev2 = decode(words[begin - 2]);
+        ctx.prev2 = &prev2;
+    }
+    return ctx;
+}
+
+int plainStalls(const std::vector<uint32_t> &words, const Block &block, bool fallsIn, PipelineKind kind)
+{
+    std::vector<DecodedInst> insts;
+    for (size_t k = block.begin; k < block.end; ++k) insts.push_back(decode(words[k]));
+    DecodedInst prev1{}, prev2{};
+    return predictStalls(insts, kind, fallsIn ? contextAbove(words, block.begin, prev1, prev2) : HeadContext{});
+}
+
+} // namespace
+
+TEST(ReorderBoundary, StallFieldsArePlainPredictedStalls)
+{
+    // A loop header entered both ways (just after a load it reads), a call,
+    // its return point, a function, and jump targets.
+    const Kites::AssembledProgram program = assembleSource(
+        "addi x5, x0, 3\nlw x6, 0(x0)\nLOOP:\nadd x6, x6, x5\naddi x5, x5, -1\nbne x5, x0, LOOP\n"
+        "jal x1, FUNC\naddi x7, x6, 1\njal x0, END\nFUNC:\nlw x8, 0(x0)\nadd x9, x8, x8\njalr x0, 0(x1)\n"
+        "END:\naddi x9, x0, 1\n");
+    const std::vector<uint32_t> &words = program.text_buffer;
+    const std::vector<size_t> leaders = labelLeaders(program);
+    const std::vector<Block> blocks = findBlocks(words, leaders);
+
+    int scoreDiffers = 0;
+    for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
+    {
+        for (ScheduleMode mode : {ScheduleMode::Greedy, ScheduleMode::Optimal})
+        {
+            const ScheduleReport r = scheduleProgram(words, kind, leaders, true, mode);
+            ASSERT_EQ(r.blocks.size(), blocks.size());
+            int stallsBefore = 0, stallsAfter = 0, scoreBefore = 0, scoreAfter = 0;
+            for (size_t b = 0; b < blocks.size(); ++b)
+            {
+                const BlockStalls &s = r.blocks[b];
+                const bool fallsIn = s.entry.fallThrough;
+                EXPECT_EQ(s.stallsBefore, plainStalls(words, blocks[b], fallsIn, kind)) << "block " << b;
+                EXPECT_EQ(s.stallsAfter, plainStalls(r.words, blocks[b], fallsIn, kind)) << "block " << b;
+                scoreDiffers += s.scoreBefore != s.stallsBefore ? 1 : 0;
+                stallsBefore += s.stallsBefore;
+                stallsAfter += s.stallsAfter;
+                scoreBefore += s.scoreBefore;
+                scoreAfter += s.scoreAfter;
+            }
+            EXPECT_EQ(r.stallsBefore, stallsBefore);
+            EXPECT_EQ(r.stallsAfter, stallsAfter);
+            EXPECT_EQ(r.scoreBefore, scoreBefore);
+            EXPECT_EQ(r.scoreAfter, scoreAfter);
+
+            // Array order: one context of weight 1 and no tail, so score == stalls.
+            const ScheduleReport a =
+                scheduleProgram(words, kind, leaders, true, mode, ContextMode::ArrayOrder);
+            for (size_t b = 0; b < blocks.size(); ++b)
+            {
+                EXPECT_EQ(a.blocks[b].scoreBefore, a.blocks[b].stallsBefore) << "block " << b;
+                EXPECT_EQ(a.blocks[b].scoreAfter, a.blocks[b].stallsAfter) << "block " << b;
+                EXPECT_EQ(a.blocks[b].stallsBefore, plainStalls(words, blocks[b], true, kind)) << "block " << b;
+            }
+        }
+    }
+    EXPECT_GT(scoreDiffers, 0);   // the loop header's weighted score is not its stall count
+}
+
+// On straight-line code the cost model is exact, so the plain stall totals
+// must equal the VM's measured stalls, before and after scheduling.
+TEST(ReorderBoundary, StallTotalsMatchTheVmOnStraightLineCode)
+{
+    for (const NamedProgram &p : reorder_test::laPrograms(8080u, 100))
+    {
+        const Kites::AssembledProgram program = assembleSource(p.source);
+        for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
+        {
+            for (ScheduleMode mode : {ScheduleMode::Greedy, ScheduleMode::Optimal})
+            {
+                const ScheduleReport r =
+                    scheduleProgram(program.text_buffer, kind, labelLeaders(program), true, mode);
+                const Kites::RunResult before =
+                    kind == PipelineKind::HF ? Kites::runProgram<Kites::RV5StageProcessorHF>(program, {}, kCycleCap)
+                                             : Kites::runProgram<Kites::RV5StageProcessorHNF>(program, {}, kCycleCap);
+                const Kites::AssembledProgram scheduled = Kites::withText(program, r.words);
+                const Kites::RunResult after =
+                    kind == PipelineKind::HF ? Kites::runProgram<Kites::RV5StageProcessorHF>(scheduled, {}, kCycleCap)
+                                             : Kites::runProgram<Kites::RV5StageProcessorHNF>(scheduled, {}, kCycleCap);
+                EXPECT_EQ(r.stallsBefore, static_cast<int>(before.stalls)) << p.name << " " << pipelineName(kind);
+                EXPECT_EQ(r.stallsAfter, static_cast<int>(after.stalls)) << p.name << " " << pipelineName(kind);
+            }
+        }
     }
 }
 
