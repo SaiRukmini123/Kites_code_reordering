@@ -452,6 +452,8 @@ TEST(ReorderAblation, NoImmediateCollision_ModelsAgree)
                 EXPECT_EQ(exact.words, textbook.words) << p.name << " " << pipelineName(kind);
                 EXPECT_EQ(exact.stallsBefore, textbook.stallsBefore) << p.name;
                 EXPECT_EQ(exact.stallsAfter, textbook.stallsAfter) << p.name;
+                EXPECT_EQ(exact.scoreBefore, textbook.scoreBefore) << p.name;
+                EXPECT_EQ(exact.scoreAfter, textbook.scoreAfter) << p.name;
                 ASSERT_EQ(exact.blocks.size(), textbook.blocks.size());
                 for (size_t b = 0; b < exact.blocks.size(); ++b)
                 {
@@ -464,4 +466,32 @@ TEST(ReorderAblation, NoImmediateCollision_ModelsAgree)
     std::cout << "[ABLATION] no-collision programs: " << programs << " programs, both models gave identical "
               << "schedules, scores and node counts (" << moved << " of the schedules moved something)" << std::endl;
     EXPECT_GT(moved, 0);
+}
+
+// The report's stall fields and score fields come from the same hazard model
+// as the schedule: with Textbook, array-order scores equal the stall fields,
+// and on straight-line code the stall totals are the whole program's
+// Textbook prediction.
+TEST(ReorderAblation, StallFieldsUseTheScheduleModel)
+{
+    for (const NamedProgram &p : randomSet("imm", makeImmediateHeavy, 5555u, 30, 12, 24))
+    {
+        const Kites::AssembledProgram program = assembleSource(p.source);
+        const std::vector<uint32_t> &words = program.text_buffer;
+        const std::vector<size_t> leaders = labelLeaders(program);
+        for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
+        {
+            const ScheduleReport array = scheduleProgram(words, kind, leaders, true, ScheduleMode::Greedy,
+                                                         ContextMode::ArrayOrder, kDefaultLoopWeight,
+                                                         HazardModel::Textbook);
+            for (const BlockStalls &b : array.blocks)
+            {
+                EXPECT_EQ(b.scoreBefore, b.stallsBefore) << p.name;
+                EXPECT_EQ(b.scoreAfter, b.stallsAfter) << p.name;
+            }
+            const ScheduleReport entries = schedule(program, kind, ScheduleMode::Greedy, HazardModel::Textbook);
+            EXPECT_EQ(entries.stallsBefore, predictStalls(words, kind, HazardModel::Textbook)) << p.name;
+            EXPECT_EQ(entries.stallsAfter, predictStalls(entries.words, kind, HazardModel::Textbook)) << p.name;
+        }
+    }
 }

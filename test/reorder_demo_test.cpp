@@ -444,8 +444,10 @@ TEST(ReorderDemo, Walkthrough)
         printStallTable("scheduled order (straight down the array):", report.words, original,
                         stallsPerInstruction(report.words, blocks, kind), program, lines);
         EXPECT_EQ(before, arrayReport.stallsBefore);
+        std::cout << "predicted stalls (each block once, from the context it is predicted with): original "
+                  << report.stallsBefore << ", scheduled " << report.stallsAfter << "\n";
         std::cout << "block-entry score (weighted by entry and tail edges, loop weight " << kDefaultLoopWeight
-                  << "): original " << report.stallsBefore << ", scheduled " << report.stallsAfter << "\n";
+                  << "): original " << report.scoreBefore << ", scheduled " << report.scoreAfter << "\n";
 
         const ScheduleReport optimalReport = scheduleProgram(words, kind, leaders, true, ScheduleMode::Optimal);
         std::cout << "greedy vs optimal (exhaustive search, block-entry weighted score), per block:\n";
@@ -454,15 +456,15 @@ TEST(ReorderDemo, Walkthrough)
             const BlockStalls &s = optimalReport.blocks[b];
             const bool proven = s.method == OptimizerMethod::Optimal ||
                                 s.method == OptimizerMethod::GreedyAlreadyZero;
-            std::string verdict = "gap " + std::to_string(s.greedyStalls - s.stallsAfter);
-            if (s.stallsAfter == s.greedyStalls)
+            std::string verdict = "gap " + std::to_string(s.greedyStalls - s.scoreAfter);
+            if (s.scoreAfter == s.greedyStalls)
             {
                 verdict = proven ? "greedy already optimal" : "no better order found";
             }
             const size_t size = s.block.end - s.block.begin;
             std::cout << "  block " << b << " (" << size << (size == 1 ? " instruction" : " instructions")
                       << "): greedy "
-                      << s.greedyStalls << ", optimal " << s.stallsAfter << ", " << verdict << " ["
+                      << s.greedyStalls << ", optimal " << s.scoreAfter << ", " << verdict << " ["
                       << optimizerMethodName(s.method) << ", " << s.nodesSearched << " nodes]\n";
         }
 
