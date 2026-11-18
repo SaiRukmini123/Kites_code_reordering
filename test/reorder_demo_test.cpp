@@ -420,6 +420,25 @@ TEST(ReorderDemo, Walkthrough)
         EXPECT_EQ(before, report.stallsBefore);
         EXPECT_EQ(after, report.stallsAfter);
 
+        const ScheduleReport optimalReport = scheduleProgram(words, kind, leaders, true, ScheduleMode::Optimal);
+        std::cout << "greedy vs optimal (exhaustive search, same head context), per block:\n";
+        for (size_t b = 0; b < optimalReport.blocks.size(); ++b)
+        {
+            const BlockStalls &s = optimalReport.blocks[b];
+            const bool proven = s.method == OptimizerMethod::Optimal ||
+                                s.method == OptimizerMethod::GreedyAlreadyZero;
+            std::string verdict = "gap " + std::to_string(s.greedyStalls - s.stallsAfter);
+            if (s.stallsAfter == s.greedyStalls)
+            {
+                verdict = proven ? "greedy already optimal" : "no better order found";
+            }
+            const size_t size = s.block.end - s.block.begin;
+            std::cout << "  block " << b << " (" << size << (size == 1 ? " instruction" : " instructions")
+                      << "): greedy "
+                      << s.greedyStalls << ", optimal " << s.stallsAfter << ", " << verdict << " ["
+                      << optimizerMethodName(s.method) << ", " << s.nodesSearched << " nodes]\n";
+        }
+
         section(std::string("(e) Suggestions and reordered .s for ") + pipelineLabel(kind));
         std::cout << writeSuggestions(source, program, report, kind) << "\n";
         const std::string assembly = writeAssembly(source, program, report);

@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 #include "reorder/block_finder.h"
+#include "reorder/block_optimizer.h"
 #include "reorder/cost_model.h"
 #include "reorder/decoded_inst.h"
 #include "reorder/dep_graph.h"
@@ -157,6 +159,158 @@ inline std::vector<uint32_t> materializeBlockOrder(const std::vector<uint32_t> &
     return result;
 }
 
+// ======================================================================
+// Exhaustive (branch-and-bound) scheduling of one block. Stable interface:
+// scheduleBlockOptimal(), scheduleBlockOptimalDetailed(), OptimalBlockResult,
+// OptimizerMethod and the two constants below.
+// ======================================================================
+
+// Largest block the search attempts: placed-instruction sets are 64-bit masks.
+inline constexpr size_t kMaxOptimalBlockSize = 64;
+
+// Default cap on search positions expanded per block. Each position costs at
+// most one issue() per instruction plus one memo entry, so this bounds both
+// time and memory for every block size; reorder_optimal_test measures the
+// time of a block that hits the cap.
+inline constexpr uint64_t kDefaultOptimalNodeBudget = 200000;
+
+// How a block's order was chosen.
+enum class OptimizerMethod : uint8_t
+{
+    NotSearched,         // ScheduleMode::Greedy: greedy order, the search never ran
+    Optimal,             // search finished: fewest predicted stalls of all legal orders
+    GreedyAlreadyZero,   // greedy already had 0 stalls, so it is optimal; nothing searched
+    BestFound,           // node cap hit; best order found beats greedy, NOT proven optimal
+    GreedyCapHit,        // node cap hit before anything beat greedy; greedy order, NOT proven optimal
+    GreedyTooLarge,      // more than kMaxOptimalBlockSize instructions; greedy order, not searched
+};
+
+inline const char *optimizerMethodName(OptimizerMethod method)
+{
+    switch (method)
+    {
+    case OptimizerMethod::NotSearched: return "greedy (not searched)";
+    case OptimizerMethod::Optimal: return "optimal";
+    case OptimizerMethod::GreedyAlreadyZero: return "optimal (greedy already 0)";
+    case OptimizerMethod::BestFound: return "best found, not proven optimal";
+    case OptimizerMethod::GreedyCapHit: return "greedy (node cap hit, not proven optimal)";
+    case OptimizerMethod::GreedyTooLarge: return "greedy (block too large to search)";
+    }
+    return "?";
+}
+
+// Result of scheduleBlockOptimalDetailed() for one block. All stall counts
+// are predictStalls() for that block with the same HeadContext.
+struct OptimalBlockResult
+{
+    // The chosen order, like scheduleBlock(): order[k] is the original local
+    // index placed at position k. Always a legal order of the dependency graph.
+    std::vector<size_t> order;
+
+    // Predicted stalls of `order`. The minimum over all legal orders when
+    // provenOptimal(); otherwise just the best this run found.
+    int optimalStalls = 0;
+
+    // Predicted stalls of scheduleBlock()'s (greedy) order for the same block.
+    // optimalStalls <= greedyStalls always.
+    int greedyStalls = 0;
+
+    // Predicted stalls of the block as written.
+    int originalStalls = 0;
+
+    OptimizerMethod method = OptimizerMethod::Optimal;
+
+    // Search positions expanded (0 when nothing was searched).
+    uint64_t nodesSearched = 0;
+
+    bool provenOptimal() const
+    {
+        return method == OptimizerMethod::Optimal || method == OptimizerMethod::GreedyAlreadyZero;
+    }
+};
+
+// Like scheduleBlock(), but returns an order with the fewest predicted stalls
+// among ALL legal orders of the block, found by branch-and-bound search (see
+// OrderSearch in block_optimizer.h) started from the greedy order.
+//
+// - If nothing beats greedy, greedy's order is returned (so the keep-original
+//   rule of scheduleBlock() still applies: the original order is kept unless
+//   a strictly better one exists).
+// - If a better order is found and proven optimal, the one that is smallest
+//   as a sequence of original indices is returned.
+// - Blocks over kMaxOptimalBlockSize, or searches that expand more than
+//   nodeBudget positions, are reported through `method`; a capped search
+//   still returns the best order it found if that beats greedy.
+inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_t> &words,
+                                                       const Block &block, PipelineKind kind,
+                                                       HeadContext ctx = {},
+                                                       bool memDisambiguation = true,
+                                                       uint64_t nodeBudget = kDefaultOptimalNodeBudget)
+{
+    const size_t n = block.end - block.begin;
+    std::vector<DecodedInst> insts;
+    insts.reserve(n);
+    for (size_t k = block.begin; k < block.end; ++k)
+    {
+        insts.push_back(decode(words[k]));
+    }
+
+    OptimalBlockResult result;
+    result.originalStalls = predictStalls(insts, kind, ctx);
+    result.order = scheduleBlock(words, block, kind, ctx, memDisambiguation);
+    std::vector<DecodedInst> greedyInsts;
+    greedyInsts.reserve(n);
+    for (size_t localIdx : result.order)
+    {
+        greedyInsts.push_back(insts[localIdx]);
+    }
+    result.greedyStalls = predictStalls(greedyInsts, kind, ctx);
+    result.optimalStalls = result.greedyStalls;
+
+    if (n <= 1)
+    {
+        result.method = OptimizerMethod::Optimal;
+        return result;
+    }
+    if (result.greedyStalls == 0)
+    {
+        result.method = OptimizerMethod::GreedyAlreadyZero;
+        return result;
+    }
+    if (n > kMaxOptimalBlockSize)
+    {
+        result.method = OptimizerMethod::GreedyTooLarge;
+        return result;
+    }
+
+    const DepGraph g = buildDepGraph(words, block, memDisambiguation);
+    const std::vector<int> cp = criticalPathLengths(g);
+    OrderSearch search(insts, g, cp, kind, nodeBudget);
+    const OrderSearchResult found = search.run(ctx, result.order, result.greedyStalls);
+
+    result.order = found.order;
+    result.optimalStalls = found.stalls;
+    result.nodesSearched = found.nodes;
+    if (found.proven)
+    {
+        result.method = OptimizerMethod::Optimal;
+    }
+    else
+    {
+        result.method = (found.stalls < result.greedyStalls) ? OptimizerMethod::BestFound
+                                                              : OptimizerMethod::GreedyCapHit;
+    }
+    return result;
+}
+
+// The order alone, with the same signature and meaning as scheduleBlock().
+inline std::vector<size_t> scheduleBlockOptimal(const std::vector<uint32_t> &words, const Block &block,
+                                                PipelineKind kind, HeadContext ctx = {},
+                                                bool memDisambiguation = true)
+{
+    return scheduleBlockOptimalDetailed(words, block, kind, ctx, memDisambiguation).order;
+}
+
 struct Move
 {
     size_t originalIndex = 0;
@@ -168,6 +322,16 @@ struct BlockStalls
     Block block{};
     int stallsBefore = 0;
     int stallsAfter = 0;
+    int greedyStalls = 0;      // greedy order's predicted stalls (same head context)
+    int optimalStalls = -1;    // ScheduleMode::Optimal only; -1 when not searched
+    OptimizerMethod method = OptimizerMethod::NotSearched;
+    uint64_t nodesSearched = 0;
+};
+
+enum class ScheduleMode : uint8_t
+{
+    Greedy,    // scheduleBlock() for every block (the default)
+    Optimal,   // scheduleBlockOptimalDetailed() for every block
 };
 
 struct ScheduleReport
@@ -194,7 +358,8 @@ struct ScheduleReport
 // final judge of correctness and benefit, not this prediction.
 inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, PipelineKind kind,
                                        const std::vector<size_t> &extraLeaders = {},
-                                       bool memDisambiguation = true)
+                                       bool memDisambiguation = true,
+                                       ScheduleMode mode = ScheduleMode::Greedy)
 {
     ScheduleReport report;
     report.words.reserve(words.size());
@@ -240,7 +405,21 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         blockStalls.stallsBefore = predictStalls(originalInsts, kind, originalCtx);
         report.stallsBefore += blockStalls.stallsBefore;
 
-        std::vector<size_t> order = scheduleBlock(words, block, kind, scheduledCtx, memDisambiguation);
+        std::vector<size_t> order;
+        if (mode == ScheduleMode::Optimal)
+        {
+            OptimalBlockResult optimal =
+                scheduleBlockOptimalDetailed(words, block, kind, scheduledCtx, memDisambiguation);
+            order = std::move(optimal.order);
+            blockStalls.greedyStalls = optimal.greedyStalls;
+            blockStalls.optimalStalls = optimal.optimalStalls;
+            blockStalls.method = optimal.method;
+            blockStalls.nodesSearched = optimal.nodesSearched;
+        }
+        else
+        {
+            order = scheduleBlock(words, block, kind, scheduledCtx, memDisambiguation);
+        }
         std::vector<uint32_t> newBlockWords = materializeBlockOrder(words, block, order);
 
         size_t outBase = report.words.size();
@@ -262,6 +441,10 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
             scheduledInsts.push_back(decode(w));
         }
         blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, scheduledCtx);
+        if (mode == ScheduleMode::Greedy)
+        {
+            blockStalls.greedyStalls = blockStalls.stallsAfter;
+        }
         report.stallsAfter += blockStalls.stallsAfter;
         report.blocks.push_back(blockStalls);
 
@@ -299,6 +482,44 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
     }
 
     return report;
+}
+
+// Greedy-vs-optimal totals of a ScheduleMode::Optimal report. Each block's
+// greedy and optimal numbers use the same head context.
+struct OptimalSummary
+{
+    int greedyStalls = 0;
+    int optimalStalls = 0;
+    size_t blocks = 0;
+    size_t provenBlocks = 0;            // Optimal or GreedyAlreadyZero
+    size_t greedyAlreadyOptimal = 0;    // proven, and optimal == greedy
+    size_t improvedBlocks = 0;          // optimal < greedy (proven or best found)
+    size_t bestFoundBlocks = 0;
+    size_t capHitBlocks = 0;
+    size_t tooLargeBlocks = 0;
+    uint64_t nodesSearched = 0;
+
+    int gap() const { return greedyStalls - optimalStalls; }
+};
+
+inline OptimalSummary summarizeOptimal(const ScheduleReport &report)
+{
+    OptimalSummary s;
+    for (const BlockStalls &b : report.blocks)
+    {
+        ++s.blocks;
+        s.greedyStalls += b.greedyStalls;
+        s.optimalStalls += b.stallsAfter;
+        s.nodesSearched += b.nodesSearched;
+        const bool proven = b.method == OptimizerMethod::Optimal || b.method == OptimizerMethod::GreedyAlreadyZero;
+        s.provenBlocks += proven ? 1 : 0;
+        s.greedyAlreadyOptimal += (proven && b.stallsAfter == b.greedyStalls) ? 1 : 0;
+        s.improvedBlocks += (b.stallsAfter < b.greedyStalls) ? 1 : 0;
+        s.bestFoundBlocks += (b.method == OptimizerMethod::BestFound) ? 1 : 0;
+        s.capHitBlocks += (b.method == OptimizerMethod::GreedyCapHit) ? 1 : 0;
+        s.tooLargeBlocks += (b.method == OptimizerMethod::GreedyTooLarge) ? 1 : 0;
+    }
+    return s;
 }
 
 } // namespace Kites::reorder
