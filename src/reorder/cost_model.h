@@ -143,6 +143,60 @@ inline int issue(WindowState &w, const DecodedInst &consumer, PipelineKind kind)
     }
 }
 
+// One way into a block: the hazard window it starts from, and how much its
+// stalls count (an edge weight; see block_entries.h).
+struct ScoredHead
+{
+    WindowState window{};
+    int weight = 1;
+};
+
+// What an order of one block is scored on:
+//   sum over heads h of  h.weight * (stalls of the block starting from h.window)
+//                      + tailWeight * (stalls of `tail` issued right after it)
+// `tail` is the first instructions of the block this one can fall through to
+// (empty if it can't). One head of weight 1 and no tail is plain
+// predictStalls() with that head's context.
+struct BlockScoring
+{
+    std::vector<ScoredHead> heads;
+    std::vector<DecodedInst> tail;
+    int tailWeight = 0;
+};
+
+inline BlockScoring singleContext(const HeadContext &ctx)
+{
+    BlockScoring s;
+    s.heads.push_back(ScoredHead{windowFrom(ctx), 1});
+    return s;
+}
+
+inline int scoreOrder(const std::vector<DecodedInst> &order, PipelineKind kind, const BlockScoring &scoring,
+                      bool withTail = true)
+{
+    int total = 0;
+    for (const ScoredHead &head : scoring.heads)
+    {
+        WindowState w = head.window;
+        int stalls = 0;
+        for (const DecodedInst &d : order)
+        {
+            stalls += issue(w, d, kind);
+        }
+        total += head.weight * stalls;
+        if (withTail)
+        {
+            int tailStalls = 0;
+            for (const DecodedInst &d : scoring.tail)
+            {
+                tailStalls += issue(w, d, kind);
+            }
+            total += scoring.tailWeight * tailStalls;
+        }
+    }
+    return total;
+}
+
 inline int predictStalls(const std::vector<DecodedInst> &block, PipelineKind kind,
                           HeadContext ctx = {})
 {

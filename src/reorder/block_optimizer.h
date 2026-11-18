@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -71,6 +72,12 @@ struct OrderSearchResult
 // its own instruction, other slots only unpinned ones, and a position where
 // an unplaced instruction has missed its deadline (see PinnedSlots) is cut.
 // Without pinned instructions the search is unchanged.
+//
+// "Stalls" here means the BlockScoring score: with several weighted heads,
+// the position holds one window per head and an instruction costs the
+// weighted sum of its stalls under each; the tail is added once an order is
+// complete (it is >= 0, so the stalls so far stay a lower bound). With one
+// head of weight 1 and no tail this is exactly the plain stall count.
 class OrderSearch
 {
 public:
@@ -89,11 +96,20 @@ public:
         }
     }
 
-    OrderSearchResult run(const HeadContext &ctx, const std::vector<size_t> &startOrder, int startStalls)
+    static constexpr size_t kMaxHeads = 2;
+
+    // `scoring` must have 1 or 2 heads.
+    OrderSearchResult run(const BlockScoring &scoring, const std::vector<size_t> &startOrder, int startStalls)
     {
+        scoring_ = &scoring;
+        Windows start{};
+        for (size_t h = 0; h < scoring.heads.size(); ++h)
+        {
+            start[h] = scoring.heads[h].window;
+        }
         best_ = startStalls;
         bestOrder_ = startOrder;
-        improve(0, windowFrom(ctx), 0);
+        improve(0, start, 0);
         const bool improved = best_ < startStalls;
 
         OrderSearchResult result;
@@ -109,7 +125,7 @@ public:
         {
             seen_.clear();
             path_.clear();
-            if (firstWithStalls(0, windowFrom(ctx), 0, best_))
+            if (firstWithStalls(0, start, 0, best_))
             {
                 result.order = path_;
             }
@@ -119,10 +135,12 @@ public:
     }
 
 private:
+    using Windows = std::array<WindowState, kMaxHeads>;
+
     struct Key
     {
         uint64_t placed;
-        uint16_t window;
+        uint32_t window;
         bool operator==(const Key &o) const { return placed == o.placed && window == o.window; }
     };
     struct KeyHash
@@ -138,15 +156,49 @@ private:
     {
         size_t index;
         int stalls;
-        WindowState after;
+        Windows after;
     };
 
-    Key keyOf(uint64_t placed, const WindowState &w) const
+    Key keyOf(uint64_t placed, const Windows &w) const
     {
-        const WindowState c = canonicalWindow(w, kind_);
         auto code = [](const Producer &p)
-        { return p.writes ? static_cast<uint16_t>(p.rd | (p.isLoad ? 32u : 0u)) : uint16_t{0}; };
-        return Key{placed, static_cast<uint16_t>(code(c.older) | (code(c.newer) << 6))};
+        { return p.writes ? static_cast<uint32_t>(p.rd | (p.isLoad ? 32u : 0u)) : uint32_t{0}; };
+        uint32_t window = 0;
+        for (size_t h = 0; h < scoring_->heads.size(); ++h)
+        {
+            const WindowState c = canonicalWindow(w[h], kind_);
+            window |= (code(c.older) | (code(c.newer) << 6)) << (12 * h);
+        }
+        return Key{placed, window};
+    }
+
+    // Weighted stalls of issuing instruction i under every head; `w` is
+    // advanced past it.
+    int issueAll(Windows &w, size_t i) const
+    {
+        int cost = 0;
+        for (size_t h = 0; h < scoring_->heads.size(); ++h)
+        {
+            cost += scoring_->heads[h].weight * issue(w[h], insts_[i], kind_);
+        }
+        return cost;
+    }
+
+    // Weighted tail stalls after a complete order.
+    int tailCost(const Windows &w) const
+    {
+        int cost = 0;
+        for (size_t h = 0; h < scoring_->heads.size(); ++h)
+        {
+            WindowState after = w[h];
+            int stalls = 0;
+            for (const DecodedInst &d : scoring_->tail)
+            {
+                stalls += issue(after, d, kind_);
+            }
+            cost += scoring_->tailWeight * stalls;
+        }
+        return cost;
     }
 
     // Ready (all predecessors placed) and allowed at the next slot: a pinned
@@ -195,7 +247,7 @@ private:
         return true;
     }
 
-    void improve(uint64_t placed, const WindowState &w, int stalls)
+    void improve(uint64_t placed, const Windows &w, int stalls)
     {
         if (best_ == 0 || aborted_)
         {
@@ -203,9 +255,10 @@ private:
         }
         if (placed == full_)
         {
-            if (stalls < best_)
+            const int total = stalls + tailCost(w);
+            if (total < best_)
             {
-                best_ = stalls;
+                best_ = total;
                 bestOrder_ = path_;
             }
             return;
@@ -220,8 +273,8 @@ private:
         {
             if (ready(i, placed))
             {
-                WindowState after = w;
-                const int cost = issue(after, insts_[i], kind_);
+                Windows after = w;
+                const int cost = issueAll(after, i);
                 if (stalls + cost < best_)
                 {
                     candidates.push_back({i, cost, after});
@@ -257,11 +310,11 @@ private:
 
     // Depth-first in original-index order: the first complete order with at
     // most `target` stalls, left in path_. Same dominance cut as improve().
-    bool firstWithStalls(uint64_t placed, const WindowState &w, int stalls, int target)
+    bool firstWithStalls(uint64_t placed, const Windows &w, int stalls, int target)
     {
         if (placed == full_)
         {
-            return stalls <= target;
+            return stalls + tailCost(w) <= target;
         }
         if (aborted_ || deadEnd(placed) || !firstVisitAtCost(keyOf(placed, w), stalls))
         {
@@ -273,8 +326,8 @@ private:
             {
                 continue;
             }
-            WindowState after = w;
-            const int cost = issue(after, insts_[i], kind_);
+            Windows after = w;
+            const int cost = issueAll(after, i);
             if (stalls + cost > target)
             {
                 continue;
@@ -296,6 +349,7 @@ private:
     const uint64_t full_;
     std::vector<uint64_t> predMask_;
     const PinnedSlots pins_;
+    const BlockScoring *scoring_ = nullptr;
 
     std::unordered_map<Key, int, KeyHash> seen_;
     std::vector<size_t> path_;

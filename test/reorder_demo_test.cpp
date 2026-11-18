@@ -357,6 +357,7 @@ TEST(ReorderDemo, Walkthrough)
 
     // (b)
     section("(b) Basic blocks");
+    const std::vector<BlockEntry> entries = blockEntries(words, blocks, leaders, kDefaultLoopWeight);
     for (size_t b = 0; b < blocks.size(); ++b)
     {
         const Block &block = blocks[b];
@@ -373,6 +374,22 @@ TEST(ReorderDemo, Walkthrough)
                                                 " (stays last)"
                                           : ", no terminator")
                   << "\n";
+        const BlockEntry &e = entries[b];
+        std::cout << "      entered: ";
+        if (e.fallThrough)
+        {
+            std::cout << "by fall-through (context = the 2 instructions above, weight " << e.fallThroughWeight << ")";
+        }
+        if (e.clean)
+        {
+            std::cout << (e.fallThrough ? " and " : "") << "clean (taken branch/jump, label, call return or "
+                      << "program start; empty window, weight " << e.cleanWeight << ")";
+        }
+        if (!e.fallThrough && !e.clean)
+        {
+            std::cout << "never (dead code; scored from an empty window)";
+        }
+        std::cout << "\n";
     }
 
     // (c)
@@ -409,22 +426,29 @@ TEST(ReorderDemo, Walkthrough)
     std::vector<uint32_t> scheduled[2];
     for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
     {
+        // The default schedule (block-entry scoring, loop weight 10) is what (e)
+        // and (f) show. The per-instruction tables predict the program run
+        // straight down the array; they are checked against array-order
+        // scoring, which predicts exactly that.
         const ScheduleReport report = scheduleProgram(words, kind, leaders);
+        const ScheduleReport arrayReport =
+            scheduleProgram(words, kind, leaders, true, ScheduleMode::Greedy, ContextMode::ArrayOrder);
         scheduled[kind == PipelineKind::HF ? 0 : 1] = report.words;
         const std::vector<size_t> original = originalIndexOf(report);
         std::vector<size_t> identity(words.size());
         for (size_t k = 0; k < identity.size(); ++k) identity[k] = k;
 
         section(std::string("(d) Predicted stalls on ") + pipelineLabel(kind));
-        const int before = printStallTable("original order:", words, identity,
+        const int before = printStallTable("original order (straight down the array):", words, identity,
                                            stallsPerInstruction(words, blocks, kind), program, lines);
-        const int after = printStallTable("scheduled order:", report.words, original,
-                                          stallsPerInstruction(report.words, blocks, kind), program, lines);
-        EXPECT_EQ(before, report.stallsBefore);
-        EXPECT_EQ(after, report.stallsAfter);
+        printStallTable("scheduled order (straight down the array):", report.words, original,
+                        stallsPerInstruction(report.words, blocks, kind), program, lines);
+        EXPECT_EQ(before, arrayReport.stallsBefore);
+        std::cout << "block-entry score (weighted by entry and tail edges, loop weight " << kDefaultLoopWeight
+                  << "): original " << report.stallsBefore << ", scheduled " << report.stallsAfter << "\n";
 
         const ScheduleReport optimalReport = scheduleProgram(words, kind, leaders, true, ScheduleMode::Optimal);
-        std::cout << "greedy vs optimal (exhaustive search, same head context), per block:\n";
+        std::cout << "greedy vs optimal (exhaustive search, block-entry weighted score), per block:\n";
         for (size_t b = 0; b < optimalReport.blocks.size(); ++b)
         {
             const BlockStalls &s = optimalReport.blocks[b];

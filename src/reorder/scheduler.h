@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "reorder/block_entries.h"
 #include "reorder/block_finder.h"
 #include "reorder/block_optimizer.h"
 #include "reorder/cost_model.h"
@@ -53,8 +54,14 @@ inline std::vector<int> criticalPathLengths(const DepGraph &g)
 // an instruction that must precede an upcoming pin runs out of slack, it is
 // the only candidate left. Several pins in a block are handled the same way.
 // Blocks without pinned instructions are scheduled exactly as before.
+//
+// This overload scores orders with a BlockScoring (several weighted head
+// windows and a tail; see cost_model.h): each candidate costs the weighted
+// stalls of the partial order under every head. When the scoring has a tail,
+// the last free choice (two instructions left) compares the two complete
+// endings including the tail. Keep-original compares full scores.
 inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, const Block &block,
-                                          PipelineKind kind, HeadContext ctx = {},
+                                          PipelineKind kind, const BlockScoring &scoring,
                                           bool memDisambiguation = true)
 {
     const size_t n = block.end - block.begin;
@@ -123,7 +130,22 @@ inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, con
             }
             std::vector<DecodedInst> trial = placed;
             trial.push_back(insts[cand]);
-            int stalls = predictStalls(trial, kind, ctx);
+            int stalls = 0;
+            if (!scoring.tail.empty() && slot + 2 == n)
+            {
+                for (size_t other = 0; other < n; ++other)
+                {
+                    if (!isPlaced[other] && other != cand)
+                    {
+                        trial.push_back(insts[other]);   // the only instruction left
+                    }
+                }
+                stalls = scoreOrder(trial, kind, scoring, true);
+            }
+            else
+            {
+                stalls = scoreOrder(trial, kind, scoring, false);
+            }
 
             bool better = (bestPos == readyList.size());
             if (!better)
@@ -175,9 +197,17 @@ inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, con
         }
     }
 
-    int originalStalls = predictStalls(insts, kind, ctx);
-    int scheduledStalls = predictStalls(placed, kind, ctx);
-    return (scheduledStalls < originalStalls) ? order : identity;
+    const int originalScore = scoreOrder(insts, kind, scoring);
+    const int scheduledScore = scoreOrder(placed, kind, scoring);
+    return (scheduledScore < originalScore) ? order : identity;
+}
+
+// One head context, weight 1, no tail: exactly predictStalls() with `ctx`.
+inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, const Block &block,
+                                          PipelineKind kind, HeadContext ctx = {},
+                                          bool memDisambiguation = true)
+{
+    return scheduleBlock(words, block, kind, singleContext(ctx), memDisambiguation);
 }
 
 // Picks out the words of one block in a given local-index order.
@@ -277,9 +307,16 @@ struct OptimalBlockResult
 // - Blocks over kMaxOptimalBlockSize, or searches that expand more than
 //   nodeBudget positions, are reported through `method`; a capped search
 //   still returns the best order it found if that beats greedy.
+//
+// This overload scores orders with a BlockScoring (1 or 2 weighted head
+// windows and a weighted tail; see cost_model.h and block_entries.h). Here
+// the OptimalBlockResult fields optimalStalls, greedyStalls and
+// originalStalls hold that WEIGHTED SCORE, not a plain stall count. The
+// single-HeadContext overload below is the same thing with one head of
+// weight 1 and no tail, so there they are plain predicted stalls.
 inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_t> &words,
                                                        const Block &block, PipelineKind kind,
-                                                       HeadContext ctx = {},
+                                                       const BlockScoring &scoring,
                                                        bool memDisambiguation = true,
                                                        uint64_t nodeBudget = kDefaultOptimalNodeBudget)
 {
@@ -292,15 +329,15 @@ inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_
     }
 
     OptimalBlockResult result;
-    result.originalStalls = predictStalls(insts, kind, ctx);
-    result.order = scheduleBlock(words, block, kind, ctx, memDisambiguation);
+    result.originalStalls = scoreOrder(insts, kind, scoring);
+    result.order = scheduleBlock(words, block, kind, scoring, memDisambiguation);
     std::vector<DecodedInst> greedyInsts;
     greedyInsts.reserve(n);
     for (size_t localIdx : result.order)
     {
         greedyInsts.push_back(insts[localIdx]);
     }
-    result.greedyStalls = predictStalls(greedyInsts, kind, ctx);
+    result.greedyStalls = scoreOrder(greedyInsts, kind, scoring);
     result.optimalStalls = result.greedyStalls;
 
     if (n <= 1)
@@ -313,7 +350,7 @@ inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_
         result.method = OptimizerMethod::GreedyAlreadyZero;
         return result;
     }
-    if (n > kMaxOptimalBlockSize)
+    if (n > kMaxOptimalBlockSize || scoring.heads.empty() || scoring.heads.size() > OrderSearch::kMaxHeads)
     {
         result.method = OptimizerMethod::GreedyTooLarge;
         return result;
@@ -322,7 +359,7 @@ inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_
     const DepGraph g = buildDepGraph(words, block, memDisambiguation);
     const std::vector<int> cp = criticalPathLengths(g);
     OrderSearch search(insts, g, cp, kind, nodeBudget);
-    const OrderSearchResult found = search.run(ctx, result.order, result.greedyStalls);
+    const OrderSearchResult found = search.run(scoring, result.order, result.greedyStalls);
 
     result.order = found.order;
     result.optimalStalls = found.stalls;
@@ -337,6 +374,17 @@ inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_
                                                               : OptimizerMethod::GreedyCapHit;
     }
     return result;
+}
+
+// One head context, weight 1, no tail: plain predicted stalls (the original
+// interface, unchanged).
+inline OptimalBlockResult scheduleBlockOptimalDetailed(const std::vector<uint32_t> &words,
+                                                       const Block &block, PipelineKind kind,
+                                                       HeadContext ctx = {},
+                                                       bool memDisambiguation = true,
+                                                       uint64_t nodeBudget = kDefaultOptimalNodeBudget)
+{
+    return scheduleBlockOptimalDetailed(words, block, kind, singleContext(ctx), memDisambiguation, nodeBudget);
 }
 
 // The order alone, with the same signature and meaning as scheduleBlock().
@@ -362,12 +410,20 @@ struct BlockStalls
     int optimalStalls = -1;    // ScheduleMode::Optimal only; -1 when not searched
     OptimizerMethod method = OptimizerMethod::NotSearched;
     uint64_t nodesSearched = 0;
+    BlockEntry entry{};        // ContextMode::BlockEntries only: how the block can be entered
+    int tailWeight = 0;        // ContextMode::BlockEntries only: weight of the tail term (0 = no tail)
 };
 
 enum class ScheduleMode : uint8_t
 {
     Greedy,    // scheduleBlock() for every block (the default)
     Optimal,   // scheduleBlockOptimalDetailed() for every block
+};
+
+enum class ContextMode : uint8_t
+{
+    BlockEntries,   // score each block by how it can be entered, plus its tail (the default)
+    ArrayOrder,     // the previous behaviour: one context, the two instructions above in the array
 };
 
 struct ScheduleReport
@@ -379,28 +435,39 @@ struct ScheduleReport
     int stallsAfter = 0;
 };
 
-// Applies scheduleBlock to every block found via findBlocks(words,
-// extraLeaders), in program order, and reassembles the full word vector.
+// Applies scheduleBlock (or the optimal search) to every block found via
+// findBlocks(words, extraLeaders), in program order, and reassembles the
+// full word vector.
 //
-// HeadContext for each block is threaded from the two instructions
-// immediately before it in the WORD ARRAY -- i.e. program-array order, not
-// real control-flow predecessors. For a block that is a branch target
-// reached from elsewhere, or reached by fall-through from a conditional
-// branch that might not be taken, this is only an approximation: the
-// instruction that really executes just before it at runtime may not be
-// whichever block sits immediately before it in the array. We accept that
-// here because it is cheap and always available; the real VM measurement
-// (instructions_retired_, total_stalls_, final registers and memory) is the
-// final judge of correctness and benefit, not this prediction.
+// ContextMode::BlockEntries (default) scores each block by how it can really
+// be entered (blockEntries()): falling through starts from the last two
+// instructions of the block above, in their scheduled order; a taken branch,
+// jal or jalr target, a label, a call's return point and program start begin
+// with an empty window (measured on both VMs in reorder_boundary_test). A
+// block entered both ways is scored under both, each weighted by its entry
+// edge (loopWeight inside a loop, else 1). If the block can fall through, the
+// stalls its order causes on the next block's first two instructions (in
+// their original order; that block isn't scheduled yet) are added, weighted
+// by that fall-through edge. A block that can't be entered at all (dead code)
+// is scored from an empty window. With loopWeight = 1 every weight is 1.
+// stallsBefore/stallsAfter then hold that weighted score.
+//
+// ContextMode::ArrayOrder is the previous behaviour: one context, the two
+// instructions immediately above in the WORD ARRAY, which is only an
+// approximation at branch targets. Either way the real VM measurement is the
+// final judge (see vm_safety_net.h).
 inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, PipelineKind kind,
                                        const std::vector<size_t> &extraLeaders = {},
                                        bool memDisambiguation = true,
-                                       ScheduleMode mode = ScheduleMode::Greedy)
+                                       ScheduleMode mode = ScheduleMode::Greedy,
+                                       ContextMode contexts = ContextMode::BlockEntries,
+                                       int loopWeight = kDefaultLoopWeight)
 {
     ScheduleReport report;
     report.words.reserve(words.size());
 
     std::vector<Block> blocks = findBlocks(words, extraLeaders);
+    const std::vector<BlockEntry> entries = blockEntries(words, blocks, extraLeaders, loopWeight);
 
     DecodedInst schedPrev1{}, schedPrev2{};
     bool haveSchedPrev1 = false, haveSchedPrev2 = false;
@@ -408,8 +475,9 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
     DecodedInst origPrev1{}, origPrev2{};
     bool haveOrigPrev1 = false, haveOrigPrev2 = false;
 
-    for (const Block &block : blocks)
+    for (size_t b = 0; b < blocks.size(); ++b)
     {
+        const Block &block = blocks[b];
         HeadContext scheduledCtx;
         if (haveSchedPrev1)
         {
@@ -438,14 +506,50 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         }
         BlockStalls blockStalls;
         blockStalls.block = block;
-        blockStalls.stallsBefore = predictStalls(originalInsts, kind, originalCtx);
+
+        // How this block is scored, from a given fall-through context.
+        auto scoringFrom = [&](const HeadContext &fallThroughCtx)
+        {
+            if (contexts == ContextMode::ArrayOrder)
+            {
+                return singleContext(fallThroughCtx);
+            }
+            const BlockEntry &entry = entries[b];
+            BlockScoring scoring;
+            if (entry.fallThrough)
+            {
+                scoring.heads.push_back(ScoredHead{windowFrom(fallThroughCtx), entry.fallThroughWeight});
+            }
+            if (entry.clean || !entry.fallThrough)
+            {
+                scoring.heads.push_back(ScoredHead{WindowState{}, entry.clean ? entry.cleanWeight : 1});
+            }
+            if (b + 1 < blocks.size() && entries[b + 1].fallThrough)
+            {
+                const Block &next = blocks[b + 1];
+                for (size_t k = next.begin; k < next.end && k < next.begin + 2; ++k)
+                {
+                    scoring.tail.push_back(decode(words[k]));
+                }
+                scoring.tailWeight = entries[b + 1].fallThroughWeight;
+            }
+            return scoring;
+        };
+        const BlockScoring originalScoring = scoringFrom(originalCtx);
+        const BlockScoring scheduledScoring = scoringFrom(scheduledCtx);
+        if (contexts == ContextMode::BlockEntries)
+        {
+            blockStalls.entry = entries[b];
+            blockStalls.tailWeight = scheduledScoring.tailWeight;
+        }
+        blockStalls.stallsBefore = scoreOrder(originalInsts, kind, originalScoring);
         report.stallsBefore += blockStalls.stallsBefore;
 
         std::vector<size_t> order;
         if (mode == ScheduleMode::Optimal)
         {
             OptimalBlockResult optimal =
-                scheduleBlockOptimalDetailed(words, block, kind, scheduledCtx, memDisambiguation);
+                scheduleBlockOptimalDetailed(words, block, kind, scheduledScoring, memDisambiguation);
             order = std::move(optimal.order);
             blockStalls.greedyStalls = optimal.greedyStalls;
             blockStalls.optimalStalls = optimal.optimalStalls;
@@ -454,7 +558,7 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         }
         else
         {
-            order = scheduleBlock(words, block, kind, scheduledCtx, memDisambiguation);
+            order = scheduleBlock(words, block, kind, scheduledScoring, memDisambiguation);
         }
         std::vector<uint32_t> newBlockWords = materializeBlockOrder(words, block, order);
 
@@ -476,7 +580,7 @@ inline ScheduleReport scheduleProgram(const std::vector<uint32_t> &words, Pipeli
         {
             scheduledInsts.push_back(decode(w));
         }
-        blockStalls.stallsAfter = predictStalls(scheduledInsts, kind, scheduledCtx);
+        blockStalls.stallsAfter = scoreOrder(scheduledInsts, kind, scheduledScoring);
         if (mode == ScheduleMode::Greedy)
         {
             blockStalls.greedyStalls = blockStalls.stallsAfter;
