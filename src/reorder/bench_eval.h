@@ -899,19 +899,22 @@ void runOptimalWithSafetyNet(const AssembledProgram &program, PipelineKind kind,
     row.originalHitCap = net.originalHitCap;
 }
 
-inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
-                         const std::function<void(const std::string &)> &progress = {})
+// A program that passed the validity filter and is not a near-duplicate of an earlier one.
+struct UsableProgram
 {
-    BenchRun run;
-    struct Usable
-    {
-        size_t filterIndex;
-        AssembledProgram program;
-        Seed seed;
-        std::vector<std::string> shape;
-    };
-    std::vector<Usable> usable;
+    size_t filterIndex = 0; // into the FilterRow list filterPrograms() filled
+    AssembledProgram program;
+    Seed seed;              // the inputs its header declares
+    std::vector<std::string> shape;
+};
 
+// The validity filter and near-duplicate removal over `paths`: one FilterRow per path appended to
+// `filter`, and the usable programs returned (shared by reorder-bench and reorder-fuzz).
+inline std::vector<UsableProgram> filterPrograms(const std::vector<std::filesystem::path> &paths,
+                                                 std::vector<FilterRow> &filter,
+                                                 const std::function<void(const std::string &)> &progress = {})
+{
+    std::vector<UsableProgram> usable;
     for (const auto &path : paths)
     {
         FilterRow row;
@@ -931,7 +934,7 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         {
             row.problems.push_back("label named '" + hangLabel +
                                    "' (a section directive): the Kites assembler hangs on it");
-            run.filter.push_back(row);
+            filter.push_back(row);
             continue;
         }
         AssembledProgram program;
@@ -942,7 +945,7 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         catch (const std::exception &e)
         {
             row.problems.push_back(std::string("does not assemble: ") + e.what());
-            run.filter.push_back(row);
+            filter.push_back(row);
             continue;
         }
         row.instructions = program.text_buffer.size();
@@ -958,23 +961,31 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         if (row.valid)
         {
             const std::vector<std::string> shape = mnemonicSequence(program.text_buffer);
-            for (const Usable &u : usable)
+            for (const UsableProgram &u : usable)
             {
                 if (shapeSimilarity(shape, u.shape) >= kDuplicateThreshold)
                 {
-                    row.duplicateOf = run.filter[u.filterIndex].name;
+                    row.duplicateOf = filter[u.filterIndex].name;
                     break;
                 }
             }
             if (row.duplicateOf.empty())
             {
-                usable.push_back({run.filter.size(), program, seed, shape});
+                usable.push_back({filter.size(), program, seed, shape});
             }
         }
-        run.filter.push_back(row);
+        filter.push_back(row);
     }
+    return usable;
+}
 
-    for (const Usable &u : usable)
+inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
+                         const std::function<void(const std::string &)> &progress = {})
+{
+    BenchRun run;
+    const std::vector<UsableProgram> usable = filterPrograms(paths, run.filter, progress);
+
+    for (const UsableProgram &u : usable)
     {
         const FilterRow &f = run.filter[u.filterIndex];
         for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
