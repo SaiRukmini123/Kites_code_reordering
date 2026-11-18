@@ -14,6 +14,7 @@
 #include "processor/rv5s/rv5s_processor_h_f.h"
 #include "processor/rv5s/rv5s_processor_h_nf.h"
 #include "reorder/asm_writer.h"
+#include "reorder_la_programs.h"
 #include "utils/utils.h"
 
 using namespace Kites::reorder;
@@ -111,7 +112,8 @@ FinalState runToEnd(const Kites::AssembledProgram &program)
         s.memWords.push_back(vm->memory_controller_.readWord(a));
     }
     const uint64_t dataStart = 0x10000000;
-    for (uint64_t a = dataStart; a < dataStart + program.data_buffer.size() + 64; a += 4)
+    // data_buffer holds one entry per value (at most 8 bytes for numbers), not one per byte.
+    for (uint64_t a = dataStart; a < dataStart + program.data_buffer.size() * 8 + 64; a += 4)
     {
         s.memWords.push_back(vm->memory_controller_.readWord(a));
     }
@@ -141,14 +143,14 @@ void expectSameFinalState(const std::string &tag, const Kites::AssembledProgram 
 // The real proof: schedule for each pipeline, write the .s, assemble it
 // again, and require (1) exactly the scheduled words and the original data,
 // (2) the same final state as the original on both VMs.
-void roundTrip(const NamedProgram &p)
+void roundTrip(const NamedProgram &p, ScheduleMode mode = ScheduleMode::Greedy)
 {
     SCOPED_TRACE(p.name);
     Kites::AssembledProgram program = assembleSource(p.source);
 
     for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
     {
-        ScheduleReport report = scheduleProgram(program.text_buffer, kind, labelLeaders(program));
+        ScheduleReport report = scheduleProgram(program.text_buffer, kind, labelLeaders(program), true, mode);
         const std::string written = writeAssembly(p.source, program, report);
         const std::string tag = p.name + " (scheduled for " + pipelineName(kind) + ")";
         SCOPED_TRACE(written);
@@ -582,6 +584,45 @@ TEST(ReorderAsmWriter, RoundTrip_LoopPrograms)
     {
         roundTrip(p);
     }
+}
+
+// `la` in the middle of blocks: the auipc stays at its address (it is
+// pinned), its addi and the instructions around it move. The written .s must
+// re-assemble to exactly the scheduled words and run identically, for both
+// the greedy and the optimal schedules.
+TEST(ReorderAsmWriter, RoundTrip_LaPrograms)
+{
+    std::vector<NamedProgram> programs = {
+        {"la_hand_written",
+         ".data\nvals: .word 3, 5, 7, 9\nout: .word 0, 0\n.text\n"
+         "addi x5, x0, 2\nla x10, vals\nlw x6, 4(x10)\nadd x7, x6, x5\nla x11, out\n"
+         "sw x7, 0(x11)\nlw x8, 8(x10)\nadd x9, x8, x8\nsw x9, 4(x11)\n"}};
+    for (const reorder_test::LaProgram &p : reorder_test::laPrograms(6060u, 40))
+    {
+        programs.push_back({p.name, p.source});
+    }
+
+    int separated = 0, pairs = 0;
+    for (const NamedProgram &p : programs)
+    {
+        roundTrip(p, ScheduleMode::Greedy);
+        roundTrip(p, ScheduleMode::Optimal);
+
+        const Kites::AssembledProgram program = assembleSource(p.source);
+        const ScheduleReport report =
+            scheduleProgram(program.text_buffer, PipelineKind::HNF, labelLeaders(program), true, ScheduleMode::Optimal);
+        const std::vector<size_t> original = originalIndexOf(report);
+        for (size_t i : reorder_test::laPairs(program.text_buffer))
+        {
+            ++pairs;
+            EXPECT_EQ(original[i], i) << p.name << ": auipc moved";
+            separated += original[i + 1] != i + 1 ? 1 : 0;
+        }
+    }
+    std::cout << "[ASMWRITER] " << programs.size() << " la programs round-tripped (greedy and optimal); in the "
+              << "h_nf optimal schedules " << separated << " of " << pairs << " la addis left their auipc"
+              << std::endl;
+    EXPECT_GT(separated, 0);
 }
 
 TEST(ReorderAsmWriter, RoundTrip_RandomForwardBranches)
