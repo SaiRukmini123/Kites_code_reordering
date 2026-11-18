@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
@@ -7,6 +8,7 @@
 
 #include "reorder/cost_model.h"
 #include "reorder/dep_graph.h"
+#include "reorder/pinned_slots.h"
 
 namespace Kites::reorder
 {
@@ -64,6 +66,11 @@ struct OrderSearchResult
 //    cut. That earlier visit tried every completion that could beat the best
 //    of its time, and best only goes down, so nothing new can be found here.
 // The search stops as soon as best reaches 0, or after nodeBudget positions.
+//
+// Pinned instructions (auipc) keep their slot: a pinned slot accepts only
+// its own instruction, other slots only unpinned ones, and a position where
+// an unplaced instruction has missed its deadline (see PinnedSlots) is cut.
+// Without pinned instructions the search is unchanged.
 class OrderSearch
 {
 public:
@@ -71,7 +78,7 @@ public:
                 const std::vector<int> &criticalPath, PipelineKind kind, uint64_t nodeBudget)
         : insts_(insts), criticalPath_(criticalPath), kind_(kind), budget_(nodeBudget),
           full_(insts.size() == 64 ? ~uint64_t{0} : (uint64_t{1} << insts.size()) - 1),
-          predMask_(insts.size(), 0)
+          predMask_(insts.size(), 0), pins_(insts, g)
     {
         for (size_t j = 0; j < insts.size(); ++j)
         {
@@ -142,9 +149,29 @@ private:
         return Key{placed, static_cast<uint16_t>(code(c.older) | (code(c.newer) << 6))};
     }
 
+    // Ready (all predecessors placed) and allowed at the next slot: a pinned
+    // slot takes only its own pinned instruction, any other slot only
+    // unpinned ones. The next slot is the number of instructions placed.
     bool ready(size_t i, uint64_t placed) const
     {
-        return ((placed >> i) & 1u) == 0 && (predMask_[i] & ~placed) == 0;
+        if (((placed >> i) & 1u) != 0 || (predMask_[i] & ~placed) != 0)
+        {
+            return false;
+        }
+        if (!pins_.any)
+        {
+            return true;
+        }
+        const size_t slot = static_cast<size_t>(std::popcount(placed));
+        return pins_.pinned[slot] ? i == slot : !pins_.pinned[i];
+    }
+
+    // An unplaced instruction has missed its deadline (PinnedSlots), so no
+    // completion can put every pinned instruction on its slot.
+    bool deadEnd(uint64_t placed) const
+    {
+        return pins_.any && pins_.someDeadlinePassed(static_cast<size_t>(std::popcount(placed)),
+                                                     [placed](size_t i) { return ((placed >> i) & 1u) != 0; });
     }
 
     // Returns false (and does not count a node) when this position was
@@ -183,7 +210,7 @@ private:
             }
             return;
         }
-        if (stalls >= best_ || !firstVisitAtCost(keyOf(placed, w), stalls))
+        if (stalls >= best_ || deadEnd(placed) || !firstVisitAtCost(keyOf(placed, w), stalls))
         {
             return;
         }
@@ -236,7 +263,7 @@ private:
         {
             return stalls <= target;
         }
-        if (aborted_ || !firstVisitAtCost(keyOf(placed, w), stalls))
+        if (aborted_ || deadEnd(placed) || !firstVisitAtCost(keyOf(placed, w), stalls))
         {
             return false;
         }
@@ -268,6 +295,7 @@ private:
     const uint64_t budget_;
     const uint64_t full_;
     std::vector<uint64_t> predMask_;
+    const PinnedSlots pins_;
 
     std::unordered_map<Key, int, KeyHash> seen_;
     std::vector<size_t> path_;

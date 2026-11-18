@@ -17,7 +17,9 @@ struct DecodedInst
     bool is_load = false, is_store = false;
     bool is_branch = false, is_jump = false;
     bool is_barrier = false;               // never moves and ends a block
-    int32_t mem_offset = 0;                 // sign-extended imm: I-type (load) or S-type (store)
+    bool is_pinned = false;                // keeps its slot (auipc: its result depends on its own
+                                           // address); other instructions may move across it
+    int32_t mem_offset = 0;                // sign-extended imm: I-type (load) or S-type (store)
     uint8_t mem_size = 0;                   // access width in bytes: 1 << (funct3 & 3)
 };
 
@@ -32,7 +34,7 @@ inline DecodedInst decode(uint32_t w)
     switch (w & 0x7F)
     {
     case 0x37: d.kind = Kind::Lui;   d.writes_rd = true; break;
-    case 0x17: d.kind = Kind::Auipc; d.writes_rd = true; d.is_barrier = true; break;
+    case 0x17: d.kind = Kind::Auipc; d.writes_rd = true; d.is_pinned = true; break;
     case 0x6F: d.kind = Kind::Jal;   d.writes_rd = true; d.is_jump = true; d.is_barrier = true; break;
     case 0x67: d.kind = Kind::Jalr;  d.writes_rd = true; d.reads_rs1 = true; d.is_jump = true; d.is_barrier = true; break;
     case 0x63: d.kind = Kind::Branch; d.reads_rs1 = d.reads_rs2 = true; d.is_branch = true; d.is_barrier = true; break;

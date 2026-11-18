@@ -58,7 +58,6 @@ const char *barrierWhat(const DecodedInst &d)
     if (d.is_branch) return "branch";
     if (d.is_jump) return "jump";
     if (d.kind == Kind::Ecall) return "ecall";
-    if (d.kind == Kind::Auipc) return "auipc (PC-relative)";
     return "unknown opcode";
 }
 
@@ -102,6 +101,10 @@ void printDecoded(size_t index, const DecodedInst &d, const Kites::AssembledProg
     if (reads.empty()) std::cout << "none";
     for (size_t k = 0; k < reads.size(); ++k) std::cout << (k ? ", " : "") << reads[k];
     std::cout << ", barrier: " << (d.is_barrier ? std::string("yes (") + barrierWhat(d) + ")" : "no")
+              << ", pinned: "
+              << (d.is_pinned ? "yes (auipc: its result depends on its own address, so it keeps its slot; "
+                                "other instructions may move across it)"
+                              : "no")
               << "\n";
 
     std::cout << "      raw rs1 = " << reg(d.rs1)

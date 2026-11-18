@@ -11,6 +11,7 @@
 #include "reorder/cost_model.h"
 #include "reorder/decoded_inst.h"
 #include "reorder/dep_graph.h"
+#include "reorder/pinned_slots.h"
 
 namespace Kites::reorder
 {
@@ -43,6 +44,15 @@ inline std::vector<int> criticalPathLengths(const DepGraph &g)
 // original local index placed at new position k. If the result is not
 // STRICTLY better than the original order by predictStalls, the identity
 // permutation is returned instead -- scheduleBlock never makes a block worse.
+//
+// Pinned instructions (auipc) keep their slot: at a pinned slot the pinned
+// instruction is placed (it is always ready by then); at any other slot only
+// unpinned instructions that still leave a legal way to finish the block
+// (PinnedSlots::canComplete) are candidates. The original order is one such
+// way, and every choice keeps one open, so greedy can never get stuck: when
+// an instruction that must precede an upcoming pin runs out of slack, it is
+// the only candidate left. Several pins in a block are handled the same way.
+// Blocks without pinned instructions are scheduled exactly as before.
 inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, const Block &block,
                                           PipelineKind kind, HeadContext ctx = {},
                                           bool memDisambiguation = true)
@@ -85,14 +95,32 @@ inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, con
     std::vector<DecodedInst> placed;
     placed.reserve(n);
 
+    const PinnedSlots pins(insts, g);
+    std::vector<bool> isPlaced(n, false);
+
     while (order.size() < n)
     {
+        const size_t slot = order.size();
         size_t bestPos = readyList.size();
         int bestStalls = 0;
 
         for (size_t r = 0; r < readyList.size(); ++r)
         {
             size_t cand = readyList[r];
+            if (pins.any)
+            {
+                if (pins.pinned[slot] ? cand != slot : pins.pinned[cand])
+                {
+                    continue;
+                }
+                isPlaced[cand] = true;
+                const bool keepsAWayOut = pins.pinned[slot] || pins.canComplete(isPlaced, slot + 1, g);
+                isPlaced[cand] = false;
+                if (!keepsAWayOut)
+                {
+                    continue;
+                }
+            }
             std::vector<DecodedInst> trial = placed;
             trial.push_back(insts[cand]);
             int stalls = predictStalls(trial, kind, ctx);
@@ -126,10 +154,17 @@ inline std::vector<size_t> scheduleBlock(const std::vector<uint32_t> &words, con
             }
         }
 
+        if (bestPos == readyList.size())
+        {
+            // Only reachable if canComplete() were wrong; never return an
+            // order that moves a pinned instruction.
+            return identity;
+        }
         size_t chosen = readyList[bestPos];
         readyList.erase(readyList.begin() + static_cast<std::ptrdiff_t>(bestPos));
         order.push_back(chosen);
         placed.push_back(insts[chosen]);
+        isPlaced[chosen] = true;
 
         for (size_t succ : g.succ[chosen])
         {
@@ -238,6 +273,7 @@ struct OptimalBlockResult
 //   a strictly better one exists).
 // - If a better order is found and proven optimal, the one that is smallest
 //   as a sequence of original indices is returned.
+// - Pinned instructions (auipc) keep their original slot, as in scheduleBlock().
 // - Blocks over kMaxOptimalBlockSize, or searches that expand more than
 //   nodeBudget positions, are reported through `method`; a capped search
 //   still returns the best order it found if that beats greedy.

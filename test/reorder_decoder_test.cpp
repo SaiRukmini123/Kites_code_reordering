@@ -95,13 +95,34 @@ TEST(ReorderDecoder, Lui)
     EXPECT_FALSE(d.is_barrier);            // unlike auipc, lui doesn't depend on its own address
 }
 
+// auipc depends on its own address, so it is pinned to its slot; it is not a
+// barrier, so other instructions may move across it.
 TEST(ReorderDecoder, Auipc)
 {
     auto d = decode(0x00000097);          // auipc x1,0
     EXPECT_EQ(d.kind, Kind::Auipc);
     EXPECT_TRUE(d.writes_rd);
-    EXPECT_TRUE(d.is_barrier);
+    EXPECT_FALSE(d.reads_rs1);
+    EXPECT_FALSE(d.reads_rs2);
+    EXPECT_TRUE(d.is_pinned);
+    EXPECT_FALSE(d.is_barrier);
     EXPECT_FALSE(d.is_jump);
+}
+
+TEST(ReorderDecoder, OnlyAuipcIsPinned)
+{
+    // beq, jal, jalr, ecall, unknown stay barriers and are not pinned.
+    for (uint32_t w : {0x00208463u, 0x0080006Fu, 0x000080E7u, 0x00000073u, 0x0000007Fu})
+    {
+        EXPECT_TRUE(decode(w).is_barrier) << std::hex << w;
+        EXPECT_FALSE(decode(w).is_pinned) << std::hex << w;
+    }
+    // lui, addi, lw, sw, add: neither.
+    for (uint32_t w : {0x000052B7u, 0x00500313u, 0x00052283u, 0x00552023u, 0x002081B3u})
+    {
+        EXPECT_FALSE(decode(w).is_barrier) << std::hex << w;
+        EXPECT_FALSE(decode(w).is_pinned) << std::hex << w;
+    }
 }
 
 TEST(ReorderDecoder, MulUsesOpEncoding)

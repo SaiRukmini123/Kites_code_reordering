@@ -42,7 +42,9 @@ inline bool writesReg(const DecodedInst &x)
 // because a field that is really part of an immediate does not read any register.
 inline bool mustStayAfter(const DecodedInst &earlier, const DecodedInst &later)
 {
-    // Barriers (branch, jump, ecall, auipc, unknown) are ordered against everything.
+    // Barriers (branch, jump, ecall, unknown) are ordered against everything.
+    // auipc is not a barrier: it is pinned to its slot by the schedulers and
+    // otherwise gets ordinary edges (it writes rd and reads nothing).
     if (earlier.is_barrier || later.is_barrier)
         return true;
 
