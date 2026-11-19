@@ -6,6 +6,7 @@
 
 #include "assembler/assembler.h"
 #include "reorder/bench_eval.h"
+#include "reorder/fuzz.h"
 #include "reorder/reorder_report.h"
 
 #include <filesystem>
@@ -285,5 +286,103 @@ int RunReorderBenchCommand(int argc, char *argv[])
         }
     }
     return 0;
+}
+
+int RunReorderFuzzCommand(int argc, char *argv[])
+{
+    fuzz::FuzzOptions options;
+    std::string programsDir = "bench/programs";
+    size_t randomCount = fuzz::kDefaultRandomPrograms;
+    std::string only;
+    auto usage = [&]()
+    {
+        std::cerr << "Usage: " << argv[0]
+                  << " reorder-fuzz [--count N] [--seed S] [--programs DIR] [--random R] [--only NAME]\n"
+                     "  Runs each usable benchmark program in DIR (default bench/programs) and R\n"
+                     "  generated random programs (default "
+                  << fuzz::kDefaultRandomPrograms
+                  << "), original vs reordered (optimizer + VM safety net),\n"
+                     "  from N random starting states each (default "
+                  << fuzz::kDefaultInputsPerProgram << ") on rv5-h-f and rv5-h-nf.\n"
+                     "  --seed S   RNG seed (default "
+                  << fuzz::kDefaultRngSeed
+                  << "); every input is reproducible from it\n"
+                     "  --only NAME  fuzz just the program with this name\n"
+                     "  Exit code 4 if any run ends in a different state.\n";
+    };
+    for (int i = 2; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        const bool hasValue = i + 1 < argc;
+        try
+        {
+            if (arg == "--count" && hasValue)
+            {
+                options.inputsPerProgram = static_cast<unsigned>(std::stoul(argv[++i]));
+            }
+            else if (arg == "--seed" && hasValue)
+            {
+                options.rngSeed = std::stoull(argv[++i], nullptr, 0);
+            }
+            else if (arg == "--programs" && hasValue)
+            {
+                programsDir = argv[++i];
+            }
+            else if (arg == "--random" && hasValue)
+            {
+                randomCount = std::stoul(argv[++i]);
+            }
+            else if (arg == "--only" && hasValue)
+            {
+                only = argv[++i];
+            }
+            else
+            {
+                usage();
+                return arg == "--help" || arg == "-h" ? 0 : 1;
+            }
+        }
+        catch (const std::exception &)
+        {
+            std::cerr << "Error: bad value for " << arg << ".\n";
+            return 1;
+        }
+    }
+
+    std::vector<fuzz::FuzzProgram> programs;
+    if (!programsDir.empty() && std::filesystem::is_directory(programsDir))
+    {
+        programs = fuzz::benchmarkPrograms(programsDir);
+    }
+    else if (programsDir != "none")
+    {
+        std::cerr << "Error: '" << programsDir << "' is not a directory (use --programs none to skip).\n";
+        return 1;
+    }
+    for (fuzz::FuzzProgram &p : fuzz::randomPrograms(randomCount, options.rngSeed))
+    {
+        programs.push_back(std::move(p));
+    }
+    if (!only.empty())
+    {
+        std::vector<fuzz::FuzzProgram> selected;
+        for (fuzz::FuzzProgram &p : programs)
+        {
+            if (p.name == only)
+            {
+                selected.push_back(std::move(p));
+            }
+        }
+        if (selected.empty())
+        {
+            std::cerr << "Error: no program named '" << only << "'.\n";
+            return 1;
+        }
+        programs = std::move(selected);
+    }
+
+    const fuzz::FuzzReport report = fuzz::fuzzPrograms(programs, options);
+    std::cout << fuzz::summaryText(report);
+    return report.mismatches.empty() ? 0 : 4;
 }
 } // namespace Kites
