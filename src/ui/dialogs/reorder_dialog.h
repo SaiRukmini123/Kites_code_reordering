@@ -3,7 +3,6 @@
 #include "processor/processor_types.h"
 #include "reorder/reorder_report.h"
 #include <QDialog>
-#include <QFutureWatcher>
 #include <QString>
 #include <optional>
 #include <string>
@@ -20,15 +19,20 @@ namespace Kites
 class ReorderListingEditor;
 
 // "Suggest reordering": schedules the editor's program for a hazard pipeline (A's scheduler),
-// shows original and suggested code side by side, verifies both on the VM in a background
-// thread, and can apply the suggestion to the editor. Built in code (no .ui file).
+// shows original and suggested code side by side, verifies both on the VM, and can apply the
+// suggestion to the editor. Built in code (no .ui file).
+//
+// Verify runs on the GUI thread: constructing a processor (in a GUI build) creates its circuit
+// scene, which holds widgets, and widgets may only be created on the GUI thread (on macOS a
+// worker thread creating one aborts the app). The dialog shows "Verifying..." and blocks input
+// while the run is bounded by the Cycle cap.
 class ReorderDialog : public QDialog
 {
     Q_OBJECT
 
 public:
     ReorderDialog(QWidget *parent, const QString &editorText, ProcessorType currentVm);
-    ~ReorderDialog() override;
+    ~ReorderDialog() override = default;
 
     // True when the editor text did not assemble; the details are in
     // globals::errors_dump_file_path (the same file Run uses), for marking the editor.
@@ -40,7 +44,6 @@ signals:
 private slots:
     void analyze();
     void verify();
-    void verifyFinished();
 
 private:
     void buildUi(ProcessorType currentVm);
@@ -48,6 +51,7 @@ private:
     void showAssemblyErrors(const QString &what);
     void setControlsEnabled(bool enabled);
     reorder::PipelineKind selectedKind() const;
+    void showVerifyResult(const reorder_report::ReorderOutcome &outcome);
 
     std::string m_editorText;   // exactly as in the editor
     std::string m_expandedText; // after custom pseudo-instruction expansion (what gets assembled)
@@ -67,6 +71,6 @@ private:
     QPushButton *m_verifyButton = nullptr;
     QPushButton *m_applyButton = nullptr;
     QLabel *m_verifyLabel = nullptr;
-    QFutureWatcher<reorder_report::ReorderOutcome> *m_verifyWatcher = nullptr;
+    bool m_verifying = false;
 };
 } // namespace Kites

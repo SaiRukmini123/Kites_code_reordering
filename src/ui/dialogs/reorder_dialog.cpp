@@ -21,7 +21,6 @@
 #include <QStringList>
 #include <QTableWidget>
 #include <QVBoxLayout>
-#include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include <fstream>
 #include <map>
@@ -50,6 +49,15 @@ QString cpiText(unsigned cycles, unsigned retired)
 {
     return QString::fromStdString(reorder_report::formatCpi(cycles, retired));
 }
+
+// Shows the wait cursor for as long as it lives, also when the scope is left by an exception.
+struct WaitCursorGuard
+{
+    WaitCursorGuard() { QApplication::setOverrideCursor(Qt::WaitCursor); }
+    ~WaitCursorGuard() { QApplication::restoreOverrideCursor(); }
+    WaitCursorGuard(const WaitCursorGuard &) = delete;
+    WaitCursorGuard &operator=(const WaitCursorGuard &) = delete;
+};
 
 // One colour per moved source line, shared by its line in the original listing and the line(s)
 // it ended up on in the suggested listing, plus "-> N" / "<- N" labels naming the partner lines.
@@ -103,28 +111,12 @@ ReorderDialog::ReorderDialog(QWidget *parent, const QString &editorText, Process
     resize(1100, 720);
     buildUi(currentVm);
 
-    m_verifyWatcher = new QFutureWatcher<reorder_report::ReorderOutcome>(this);
-    connect(m_verifyWatcher, &QFutureWatcher<reorder_report::ReorderOutcome>::finished, this,
-            &ReorderDialog::verifyFinished);
-
     assembleEditorText();
     if (!m_assemblyFailed)
     {
         analyze();
     }
     connect(m_vmCombo, &QComboBox::currentIndexChanged, this, &ReorderDialog::analyze);
-}
-
-ReorderDialog::~ReorderDialog()
-{
-    // runProgram silences the process-wide std::cout while it runs, so a verification must not
-    // outlive the dialog (the main VM could start printing). It is bounded by the cycle cap.
-    if (m_verifyWatcher && m_verifyWatcher->isRunning())
-    {
-        QApplication::setOverrideCursor(Qt::WaitCursor);
-        m_verifyWatcher->waitForFinished();
-        QApplication::restoreOverrideCursor();
-    }
 }
 
 void ReorderDialog::buildUi(ProcessorType currentVm)
@@ -180,20 +172,24 @@ void ReorderDialog::buildUi(ProcessorType currentVm)
     makePane("Original", m_originalView, originalHeading);
     makePane("Suggested", m_suggestedView, m_suggestedHeading);
     layout->addWidget(splitter, 1);
+    // One sentence per line.
     auto *legend = new QLabel(QString::fromUtf8(
-                                  "Each moved line has its own colour, the same on both sides; "
-                                  "\u2192 N in the original gutter is the line it moved to, "
-                                  "\u2190 N in the suggested gutter the line it came from.  "
+                                  "Each moved line has its own colour, the same on both sides.\n"
+                                  "\u2192 N in the original gutter is the line it moved to.\n"
+                                  "\u2190 N in the suggested gutter is the line it came from.\n"
                                   "+N: predicted stall cycles before that line's instruction."),
                               this);
-    legend->setWordWrap(true);
+    legend->setObjectName("legendLabel");
+    legend->setTextFormat(Qt::PlainText);
     layout->addWidget(legend);
 
     // Predicted stalls per block.
     m_blockTable = new QTableWidget(0, 3, this);
     m_blockTable->setHorizontalHeaderLabels({"Block (source lines)", "Predicted stalls before",
                                              "Predicted stalls after"});
+    m_blockTable->setObjectName("blockTable");
     m_blockTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    m_blockTable->horizontalHeader()->setDefaultAlignment(Qt::AlignCenter);
     m_blockTable->verticalHeader()->setVisible(false);
     m_blockTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_blockTable->setSelectionMode(QAbstractItemView::NoSelection);
@@ -204,26 +200,32 @@ void ReorderDialog::buildUi(ProcessorType currentVm)
     auto *verifyRow = new QHBoxLayout();
     verifyRow->addWidget(new QLabel("Seed:", this));
     m_seedEdit = new QLineEdit(this);
+    m_seedEdit->setObjectName("seedEdit");
     m_seedEdit->setPlaceholderText("optional, e.g. x10=0x10000000,mem:0x10000000=7");
     verifyRow->addWidget(m_seedEdit, 1);
     verifyRow->addWidget(new QLabel("Cycle cap:", this));
     m_capSpin = new QSpinBox(this);
+    m_capSpin->setObjectName("capSpin");
     m_capSpin->setRange(100, 100000000);
     m_capSpin->setValue(static_cast<int>(reorder_report::kDefaultCycleCap));
     m_capSpin->setSingleStep(100000);
     verifyRow->addWidget(m_capSpin);
     m_verifyButton = new QPushButton("Verify", this);
+    m_verifyButton->setObjectName("verifyButton");
     m_verifyButton->setToolTip("Run original and suggested code on the VM and compare final state");
     verifyRow->addWidget(m_verifyButton);
     layout->addLayout(verifyRow);
 
     m_verifyLabel = new QLabel(this);
+    m_verifyLabel->setObjectName("verifyLabel");
+    m_verifyLabel->setTextFormat(Qt::RichText); // every inserted string is HTML-escaped
     m_verifyLabel->setWordWrap(true);
     m_verifyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(m_verifyLabel);
 
     auto *buttons = new QDialogButtonBox(this);
     m_applyButton = buttons->addButton("Apply to Editor", QDialogButtonBox::AcceptRole);
+    m_applyButton->setObjectName("applyButton");
     buttons->addButton(QDialogButtonBox::Close);
     layout->addWidget(buttons);
 
@@ -354,9 +356,14 @@ void ReorderDialog::analyze()
         const QString lines = b.firstLine == b.lastLine
                                   ? QString("line %1").arg(b.firstLine)
                                   : QString("lines %1-%2").arg(b.firstLine).arg(b.lastLine);
-        m_blockTable->setItem(row, 0, new QTableWidgetItem(lines));
-        m_blockTable->setItem(row, 1, new QTableWidgetItem(QString::number(b.stallsBefore)));
-        m_blockTable->setItem(row, 2, new QTableWidgetItem(QString::number(b.stallsAfter)));
+        const QString cells[] = {lines, QString::number(b.stallsBefore),
+                                 QString::number(b.stallsAfter)};
+        for (int column = 0; column < 3; ++column)
+        {
+            auto *item = new QTableWidgetItem(cells[column]);
+            item->setTextAlignment(Qt::AlignCenter);
+            m_blockTable->setItem(row, column, item);
+        }
     }
 
     QString summary;
@@ -403,40 +410,87 @@ void ReorderDialog::analyze()
 
 void ReorderDialog::verify()
 {
-    if (!m_program || m_verifyWatcher->isRunning())
+    if (!m_program || m_verifying)
     {
         return;
     }
-    Seed seed;
     try
     {
-        seed = reorder_report::parseSeed(m_seedEdit->text().toStdString());
+        Seed seed;
+        try
+        {
+            seed = reorder_report::parseSeed(m_seedEdit->text().toStdString()); // empty: default
+        }
+        catch (const std::exception &e)
+        {
+            m_verifyLabel->setText(
+                QString("Invalid seed: %1").arg(QString::fromStdString(e.what()).toHtmlEscaped()));
+            return;
+        }
+
+        // Copies only: the run never touches the app's processor or the editor.
+        const AssembledProgram program = *m_program;
+        const PipelineKind kind = selectedKind();
+        const unsigned cap = static_cast<unsigned>(m_capSpin->value());
+
+        // Runs on the GUI thread (see the class comment); input is blocked until it returns.
+        m_verifying = true;
+        setControlsEnabled(false);
+        m_verifyButton->setText("Verifying...");
+        m_verifyLabel->setText(QString("Running original and suggested code on %1...")
+                                   .arg(QString::fromLatin1(reorder_report::vmName(kind))));
+        m_verifyButton->repaint();
+        m_verifyLabel->repaint();
+
+        std::optional<reorder_report::ReorderOutcome> outcome;
+        QString failure;
+        {
+            WaitCursorGuard waitCursor;
+            try
+            {
+                outcome = reorder_report::runReorder(program, kind, seed, cap);
+            }
+            catch (const std::exception &e)
+            {
+                failure = QString::fromStdString(e.what());
+            }
+            catch (...)
+            {
+                failure = "unknown error";
+            }
+        }
+
+        m_verifying = false;
+        m_verifyButton->setText("Verify");
+        setControlsEnabled(true);
+        analyze(); // restores the Apply state (and clears the verify label)
+        if (!outcome)
+        {
+            m_verifyLabel->setText(
+                QString("Verification could not run: %1").arg(failure.toHtmlEscaped()));
+            return;
+        }
+        showVerifyResult(*outcome);
     }
     catch (const std::exception &e)
     {
-        m_verifyLabel->setText(QString("Seed: %1").arg(QString::fromStdString(e.what()).toHtmlEscaped()));
-        return;
+        m_verifying = false;
+        m_verifyButton->setText("Verify");
+        m_verifyButton->setEnabled(true);
+        m_verifyLabel->setText(QString("Verification could not run: %1")
+                                   .arg(QString::fromStdString(e.what()).toHtmlEscaped()));
     }
-
-    const AssembledProgram program = *m_program;
-    const PipelineKind kind = selectedKind();
-    const unsigned cap = static_cast<unsigned>(m_capSpin->value());
-    setControlsEnabled(false);
-    m_verifyButton->setText("Verifying...");
-    m_verifyLabel->setText(QString("Running original and suggested code on %1...")
-                               .arg(QString::fromLatin1(reorder_report::vmName(kind))));
-    // Copies only: the worker never touches the dialog.
-    m_verifyWatcher->setFuture(QtConcurrent::run([program, kind, seed, cap]()
-                                                 { return reorder_report::runReorder(program, kind, seed, cap); }));
+    catch (...)
+    {
+        m_verifying = false;
+        m_verifyButton->setText("Verify");
+        m_verifyButton->setEnabled(true);
+        m_verifyLabel->setText("Verification could not run: unknown error");
+    }
 }
 
-void ReorderDialog::verifyFinished()
+void ReorderDialog::showVerifyResult(const reorder_report::ReorderOutcome &o)
 {
-    m_verifyButton->setText("Verify");
-    setControlsEnabled(true);
-    analyze(); // restores the Apply state (and clears the verify label)
-
-    const reorder_report::ReorderOutcome o = m_verifyWatcher->result();
     QString verdict;
     if (o.before.hitCap || o.after.hitCap)
     {

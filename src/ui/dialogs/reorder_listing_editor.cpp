@@ -40,13 +40,9 @@ QColor ReorderListingEditor::linkColor(int colorIndex)
     // apart on the colour wheel; after 12 links the sequence repeats and the gutter labels still
     // name the partner line.
     static const int kHues[] = {0, 210, 120, 30, 270, 165, 55, 320, 90, 240, 190, 300};
-    const int hue = kHues[colorIndex % 12];
-    const QColor accent = QColor::fromHsv(hue, 190, 235);
-    const QColor background = ThemeManager::getInstance().getEditorBackgroundColor();
-    const double weight = 0.38;
-    return QColor::fromRgbF(background.redF() * (1 - weight) + accent.redF() * weight,
-                            background.greenF() * (1 - weight) + accent.greenF() * weight,
-                            background.blueF() * (1 - weight) + accent.blueF() * weight);
+    QColor color = QColor::fromHsv(kHues[colorIndex % 12], 190, 235);
+    color.setAlphaF(kLinkAlpha);
+    return color;
 }
 
 void ReorderListingEditor::setListing(const QString &text,

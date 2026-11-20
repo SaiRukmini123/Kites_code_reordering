@@ -45,6 +45,7 @@ protected:
                 auto it = m_listingEditor->m_links.find(lineNumber);
                 if (it != m_listingEditor->m_links.end())
                 {
+                    // translucent, over the background filled above: same colour as the line
                     painter.fillRect(QRect(0, top, width(), bottom - top),
                                      ReorderListingEditor::linkColor(it->second.colorIndex));
                     painter.setPen(themeManager.getEditorForegroundColor());

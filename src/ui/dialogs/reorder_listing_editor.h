@@ -34,8 +34,14 @@ public:
     void setListing(const QString &text, const std::map<unsigned, ListingLineLink> &links,
                     const std::map<unsigned, int> &stallsByLine);
 
-    // The colour for a link, mixed into the current editor background so it reads in light and
-    // dark themes. Neighbouring indices get clearly different hues.
+    // Opacity of every moved-line colour (line highlight and gutter cell), drawn over the editor
+    // background. At 0.35 the code text keeps a contrast of at least about 3:1 on all built-in
+    // themes (about 8:1 on kites-light) and neighbouring colours stay clearly apart; no theme
+    // needs a higher value.
+    static constexpr double kLinkAlpha = 0.35;
+
+    // The colour for a link: a translucent hue (alpha kLinkAlpha), so it reads in light and dark
+    // themes. Neighbouring indices get clearly different hues.
     static QColor linkColor(int colorIndex);
 
 protected:
