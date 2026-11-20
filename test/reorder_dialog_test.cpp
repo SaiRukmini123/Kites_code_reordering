@@ -176,7 +176,9 @@ TEST_F(ReorderDialogTest, GcdVerifiesWithEmptySeed)
     ASSERT_FALSE(dialog.assemblyFailed());
     const QString status = clickVerify(dialog, "");
     EXPECT_TRUE(status.contains("Equal:")) << status.toStdString();
-    EXPECT_TRUE(status.contains("rv5-h-nf")) << status.toStdString();
+    // Only the verdict is shown; the cycles/CPI line was removed.
+    EXPECT_FALSE(status.contains("<br>")) << status.toStdString();
+    EXPECT_FALSE(status.contains("CPI")) << status.toStdString();
 }
 
 TEST_F(ReorderDialogTest, GcdVerifiesWithValidSeed)

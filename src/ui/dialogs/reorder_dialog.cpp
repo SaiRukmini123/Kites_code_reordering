@@ -45,11 +45,6 @@ const char *processorTypeName(ProcessorType type)
     }
 }
 
-QString cpiText(unsigned cycles, unsigned retired)
-{
-    return QString::fromStdString(reorder_report::formatCpi(cycles, retired));
-}
-
 // Shows the wait cursor for as long as it lives, also when the scope is left by an exception.
 struct WaitCursorGuard
 {
@@ -507,17 +502,7 @@ void ReorderDialog::showVerifyResult(const reorder_report::ReorderOutcome &o)
     {
         verdict = "<b>NOT equal:</b> the final registers or data memory differ.";
     }
-    m_verifyLabel->setText(
-        QString("%1<br>On %2: cycles %3 &rarr; %4, stall cycles %5 &rarr; %6, CPI %7 &rarr; %8, "
-                "instructions retired %9 &rarr; %10.")
-            .arg(verdict, QString::fromLatin1(reorder_report::vmName(o.kind)))
-            .arg(o.before.cycles)
-            .arg(o.after.cycles)
-            .arg(o.before.stalls)
-            .arg(o.after.stalls)
-            .arg(cpiText(o.before.cycles, o.before.retired), cpiText(o.after.cycles, o.after.retired))
-            .arg(o.before.retired)
-            .arg(o.after.retired));
+    m_verifyLabel->setText(verdict);
     if (!o.equivalent)
     {
         m_applyButton->setEnabled(false);
