@@ -178,12 +178,15 @@ struct Slot
 
 // One instruction through the HDU: the same loop as issue() in cost_model.h
 // (raw rs1/rs2 fields, a bubble shifted in per stall cycle, then re-checked),
-// but it also records which producer each hazard came from.
+// but it also records which producer each hazard came from. `model` masks the
+// fields exactly as issue() does; HazardModel::Exact (raw fields) is what the VM
+// does, Textbook is only for tests that must see the replay disagree with the VM.
 inline int issueTracked(Slot &older, Slot &newer, const DecodedInst &consumer, uint64_t consumerPc,
-                        uint64_t blockEntry, PipelineKind kind, bool discarded, std::vector<StallRecord> &records)
+                        uint64_t blockEntry, PipelineKind kind, bool discarded, std::vector<StallRecord> &records,
+                        HazardModel model = HazardModel::Exact)
 {
-    const uint8_t rs1 = consumer.rs1;
-    const uint8_t rs2 = consumer.rs2;
+    const uint8_t rs1 = (model == HazardModel::Exact || consumer.reads_rs1) ? consumer.rs1 : 0;
+    const uint8_t rs2 = (model == HazardModel::Exact || consumer.reads_rs2) ? consumer.rs2 : 0;
     Slot prev = older;
     Slot cur = newer;
     int stalls = 0;
@@ -218,9 +221,11 @@ inline int issueTracked(Slot &older, Slot &newer, const DecodedInst &consumer, u
 
 // Replays `path` (traced on the original program) with the instruction words
 // `words`, which must keep every block of `blocks` in place: the original
-// words, or any reordering inside blocks.
+// words, or any reordering inside blocks. `model` is HazardModel::Exact (what
+// the VM does) unless a test asks for the Textbook rule on purpose.
 inline ReplayResult replayPath(const std::vector<uint32_t> &words, const std::vector<Block> &blocks,
-                               const ExecutedPath &path, PipelineKind kind)
+                               const ExecutedPath &path, PipelineKind kind,
+                               HazardModel model = HazardModel::Exact)
 {
     std::vector<DecodedInst> insts;
     insts.reserve(words.size());
@@ -263,7 +268,7 @@ inline ReplayResult replayPath(const std::vector<uint32_t> &words, const std::ve
                     replay_detail::Slot o = older;
                     replay_detail::Slot n = newer;
                     r.discardedStalls += replay_detail::issueTracked(o, n, insts[prev + 1], textStart + 4 * (prev + 1),
-                                                                     entry + 1, kind, true, r.stalls);
+                                                                     entry + 1, kind, true, r.stalls, model);
                 }
                 older = newer = replay_detail::Slot{};
             }
@@ -273,7 +278,7 @@ inline ReplayResult replayPath(const std::vector<uint32_t> &words, const std::ve
             ++entry;
         }
         r.stallCycles += replay_detail::issueTracked(older, newer, insts[index], textStart + 4 * index, entry, kind,
-                                                     false, r.stalls);
+                                                     false, r.stalls, model);
     }
     r.retired = path.indices.size();
     r.predictedCycles = r.retired + 4 + r.stallCycles + r.flushCycles;
@@ -283,9 +288,10 @@ inline ReplayResult replayPath(const std::vector<uint32_t> &words, const std::ve
 // The same, with the blocks the scheduler uses for `program` (every code
 // label is a leader).
 inline ReplayResult replayPath(const AssembledProgram &program, const std::vector<uint32_t> &words,
-                               const ExecutedPath &path, PipelineKind kind)
+                               const ExecutedPath &path, PipelineKind kind,
+                               HazardModel model = HazardModel::Exact)
 {
-    return replayPath(words, findBlocks(program.text_buffer, labelLeaders(program)), path, kind);
+    return replayPath(words, findBlocks(program.text_buffer, labelLeaders(program)), path, kind, model);
 }
 
 } // namespace Kites::reorder

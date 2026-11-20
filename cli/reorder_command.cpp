@@ -294,10 +294,18 @@ int RunReorderFuzzCommand(int argc, char *argv[])
     std::string programsDir = "bench/programs";
     size_t randomCount = fuzz::kDefaultRandomPrograms;
     std::string only;
+    std::string generator = "v1";
+    std::string checks;
+    bool optimizerTable = false;
+    size_t tableBlocks = 50;
     auto usage = [&]()
     {
         std::cerr << "Usage: " << argv[0]
                   << " reorder-fuzz [--count N] [--seed S] [--programs DIR] [--random R] [--only NAME]\n"
+                     "                 [--generator v1|v2] [--checks basic|all]\n"
+                     "       "
+                  << argv[0]
+                  << " reorder-fuzz --optimizer-table [--blocks B] [--seed S]\n"
                      "  Runs each usable benchmark program in DIR (default bench/programs) and R\n"
                      "  generated random programs (default "
                   << fuzz::kDefaultRandomPrograms
@@ -308,7 +316,15 @@ int RunReorderFuzzCommand(int argc, char *argv[])
                   << fuzz::kDefaultRngSeed
                   << "); every input is reproducible from it\n"
                      "  --only NAME  fuzz just the program with this name\n"
-                     "  Exit code 4 if any run ends in a different state.\n";
+                     "  --generator v1  straight-line programs (the original set; default)\n"
+                     "  --generator v2  structured programs: branches, bounded loops, every load/store\n"
+                     "                  size, la inside blocks, edge-case immediates\n"
+                     "  --checks basic  final state, declared input, never slower, block invariants\n"
+                     "                  (default with v1)\n"
+                     "  --checks all    also path replay exactness and unrolled programs (default with v2)\n"
+                     "  --optimizer-table  optimizer time, proven-optimal share and stalls for random\n"
+                     "                  blocks of 8-64 instructions (B per size, default 50); no fuzzing\n"
+                     "  Exit code 4 if any run ends in a different state or a check fails.\n";
     };
     for (int i = 2; i < argc; ++i)
     {
@@ -336,6 +352,24 @@ int RunReorderFuzzCommand(int argc, char *argv[])
             {
                 only = argv[++i];
             }
+            else if (arg == "--generator" && hasValue && (std::string(argv[i + 1]) == "v1" ||
+                                                         std::string(argv[i + 1]) == "v2"))
+            {
+                generator = argv[++i];
+            }
+            else if (arg == "--checks" && hasValue && (std::string(argv[i + 1]) == "basic" ||
+                                                      std::string(argv[i + 1]) == "all"))
+            {
+                checks = argv[++i];
+            }
+            else if (arg == "--optimizer-table")
+            {
+                optimizerTable = true;
+            }
+            else if (arg == "--blocks" && hasValue)
+            {
+                tableBlocks = std::stoul(argv[++i]);
+            }
             else
             {
                 usage();
@@ -349,6 +383,21 @@ int RunReorderFuzzCommand(int argc, char *argv[])
         }
     }
 
+    if (optimizerTable)
+    {
+        const std::vector<size_t> sizes = {8, 16, 24, 32, 48, 64};
+        std::cout << fuzz::optimizerTableMarkdown(fuzz::optimizerTable(sizes, tableBlocks, options.rngSeed),
+                                                  tableBlocks, options.rngSeed);
+        return 0;
+    }
+
+    if (checks.empty())
+    {
+        checks = generator == "v2" ? "all" : "basic";
+    }
+    options.checkReplay = checks == "all";
+    options.checkUnroll = checks == "all";
+
     std::vector<fuzz::FuzzProgram> programs;
     if (!programsDir.empty() && std::filesystem::is_directory(programsDir))
     {
@@ -359,7 +408,10 @@ int RunReorderFuzzCommand(int argc, char *argv[])
         std::cerr << "Error: '" << programsDir << "' is not a directory (use --programs none to skip).\n";
         return 1;
     }
-    for (fuzz::FuzzProgram &p : fuzz::randomPrograms(randomCount, options.rngSeed))
+    std::vector<fuzz::FuzzProgram> generated = generator == "v2"
+                                                   ? fuzz::structuredPrograms(randomCount, options.rngSeed)
+                                                   : fuzz::randomPrograms(randomCount, options.rngSeed);
+    for (fuzz::FuzzProgram &p : generated)
     {
         programs.push_back(std::move(p));
     }
@@ -381,8 +433,9 @@ int RunReorderFuzzCommand(int argc, char *argv[])
         programs = std::move(selected);
     }
 
+    std::cout << "Generator " << generator << ", checks " << checks << "\n";
     const fuzz::FuzzReport report = fuzz::fuzzPrograms(programs, options);
     std::cout << fuzz::summaryText(report);
-    return report.mismatches.empty() ? 0 : 4;
+    return fuzz::fuzzClean(report) ? 0 : 4;
 }
 } // namespace Kites
