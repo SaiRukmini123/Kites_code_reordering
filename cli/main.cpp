@@ -45,6 +45,7 @@ void printUsage(const char *programName)
         << "  reorder-bench   validity filter + batch run, writes CSVs and a summary\n"
         << "       " << programName
         << " reorder-fuzz [--count N] [--seed S] [--programs DIR] [--random R] [--only NAME]\n"
+        << "                  [--generator v1|v2] [--checks basic|all] [--optimizer-table]\n"
         << "  reorder-fuzz    original vs reordered from random starting registers and memory\n";
 }
 
