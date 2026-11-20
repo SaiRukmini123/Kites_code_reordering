@@ -7,6 +7,7 @@
 #include "ui/cache_tab/cachetab.h"
 #include "ui/compiler_tab/compilertab.h"
 #include "ui/dialogs/processor_dialog.h"
+#include "ui/dialogs/reorder_dialog.h"
 #include "ui/dialogs/settings_dialog.h"
 #include "ui/editor_tab/editortab.h"
 #include "ui/memory_tab/memorytab.h"
@@ -179,6 +180,13 @@ void MainWindow::setUpToolBar()
     toolbar->addAction(undoAction);
     toolbar->addAction(redoAction);
 
+    // Shared with the Tools menu (setUpMenubar). Disabled while a program runs: see run().
+    m_reorderAction = new QAction("Suggest Reordering...", this);
+    m_reorderAction->setToolTip("Suggest an instruction order with fewer pipeline stalls");
+    toolbar->addSeparator();
+    toolbar->addAction(m_reorderAction);
+    connect(m_reorderAction, &QAction::triggered, this, &MainWindow::reorderDialog);
+
     connect(runAction, &QAction::triggered, this,
             [this, processorAction, runAction, pauseAction, debugAction]()
             {
@@ -291,6 +299,7 @@ void MainWindow::setUpMenubar()
 {
     QMenu *fileMenu     = menuBar()->addMenu("&File");
     QMenu *settingsMenu = menuBar()->addMenu("&Settings");
+    QMenu *toolsMenu    = menuBar()->addMenu("&Tools");
     QMenu *helpMenu     = menuBar()->addMenu("&Help");
 
     QMenu *preferencesMenu = new QMenu("Preferences", this);
@@ -347,6 +356,8 @@ void MainWindow::setUpMenubar()
                 dialog.exec();
             });
     settingsMenu->addAction(advancedSettingsAction);
+    ////////////Tools Menu//////////////////
+    toolsMenu->addAction(m_reorderAction);
     ///////////Help Menu///////////////////
     helpMenu->addAction(aboutAction);
 
@@ -463,6 +474,9 @@ bool MainWindow::tryParseAndLoadProgram()
 
 void MainWindow::run(bool startPaused)
 {
+    // the reorder dialog runs VMs in the background and silences std::cout while it does, so it
+    // must not overlap a run; runFinishedSlot() enables it again
+    m_reorderAction->setEnabled(false);
     // as soon s as run is clicked we disable the toolbar buttons
     // disableToolBarButtons();
     if (tryParseAndLoadProgram())
@@ -498,6 +512,24 @@ void MainWindow::processorChangeDialog()
     dialog.exec();
 }
 
+void MainWindow::reorderDialog()
+{
+    auto *editor = dynamic_cast<EditorTab *>(m_tabs[TabIndex::EditorTabIndex]);
+    if (!editor)
+    {
+        return;
+    }
+    ReorderDialog dialog(this, QString::fromStdString(editor->getRawText()),
+                         m_processorManager->getProcessorType());
+    if (dialog.assemblyFailed())
+    {
+        editor->setErrorLinesFromFile(globals::errors_dump_file_path);
+    }
+    connect(&dialog, &ReorderDialog::applyRequested, this,
+            [editor](const QString &reorderedText) { editor->replaceRawTextUndoable(reorderedText); });
+    dialog.exec();
+}
+
 void MainWindow::processorChanged(const ProcessorType &vmType)
 {
     m_processorManager->changeProcessor(vmType);
@@ -526,6 +558,7 @@ void MainWindow::runFinishedSlot()
     // other we are not alble to move the cursor as the paint
     //  keeps jumping to last highlighted line
     editor->switchToEditorView();
+    m_reorderAction->setEnabled(true);
     QList<QToolBar *> toolbars = this->findChildren<QToolBar *>();
     // since we only have one toolbar we can directly access it
     for (QAction *action : toolbars[0]->actions())

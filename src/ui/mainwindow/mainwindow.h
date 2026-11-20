@@ -58,6 +58,7 @@ private:
     bool tryParseAndLoadProgram();
     void run(bool startPaused = false);
     void processorChangeDialog();
+    void reorderDialog();
     Ui::MainWindow *ui;
 
     // QToolBar *m_mainToolbar = nullptr;
@@ -66,6 +67,7 @@ private:
     RegisterContainer *m_registerContainer {nullptr};
     ProcessorManager  *m_processorManager  {nullptr};
     QThread           *m_processorThread   {nullptr};
+    QAction           *m_reorderAction     {nullptr};
     TabIndex           m_currentTabIndex   {TabIndex::EditorTabIndex};
     ExecutionState     m_executionState    {ExecutionState::Stopped};
 

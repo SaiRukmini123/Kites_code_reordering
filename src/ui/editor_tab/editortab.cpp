@@ -3,6 +3,7 @@
 #include "ui/theme/theme_manager.h"
 #include "ui_editortab.h"
 #include <QFile>
+#include <QTextCursor>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -133,6 +134,15 @@ std::vector<uint64_t> EditorTab::getBreakpoints() const
 void EditorTab::setRawText(const QString &text)
 {
     m_editor->setPlainText(text);
+}
+
+void EditorTab::replaceRawTextUndoable(const QString &text)
+{
+    QTextCursor cursor(m_editor->document());
+    cursor.beginEditBlock();
+    cursor.select(QTextCursor::Document);
+    cursor.insertText(text);
+    cursor.endEditBlock();
 }
 
 void EditorTab::resetErrorLines()

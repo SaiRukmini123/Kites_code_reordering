@@ -31,6 +31,9 @@ public:
     void setErrorLinesFromFile(const std::filesystem::path &filepath);
     std::string getRawText();
     void setRawText(const QString &text);
+    // Replaces the whole text as one edit, so Ctrl+Z restores the previous text
+    // (setRawText uses setPlainText, which clears the undo history).
+    void replaceRawTextUndoable(const QString &text);
     void resetErrorLines();
     void highlightLines(const std::vector<std::pair<int,std::string>> &editorLines, 
       const std::vector<std::pair<int,std::string>> &disassemblyLines);
