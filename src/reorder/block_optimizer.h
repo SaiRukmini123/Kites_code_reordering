@@ -179,7 +179,7 @@ private:
         int cost = 0;
         for (size_t h = 0; h < scoring_->heads.size(); ++h)
         {
-            cost += scoring_->heads[h].weight * issue(w[h], insts_[i], kind_);
+            cost += scoring_->heads[h].weight * issue(w[h], insts_[i], kind_, scoring_->model);
         }
         return cost;
     }
@@ -194,7 +194,7 @@ private:
             int stalls = 0;
             for (const DecodedInst &d : scoring_->tail)
             {
-                stalls += issue(after, d, kind_);
+                stalls += issue(after, d, kind_, scoring_->model);
             }
             cost += scoring_->tailWeight * stalls;
         }

@@ -28,9 +28,9 @@ Scheduled with ScheduleMode::Optimal (block-entry scoring). "total cycles" is th
 | loop | 10 | 6 | 1895 | 1821 | 3.91% |
 | mixed | 9 | 3 | 1057 | 1049 | 0.76% |
 
-Block numbers below are the scheduler's block score (stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions); remaining stalls are classified only where the optimizer proved them optimal.
+Block counts below use the scheduler's weighted block score (scoreBefore/scoreAfter: stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions), the objective the scheduler and optimizer minimize; plain predicted stalls are in blocks.csv (predicted_stalls_*). Remaining score is classified only where the optimizer proved it optimal.
 
-Blocks with predicted stalls: 47 (stalls removed: 28, reduced: 2, not reduced: 17). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 0
+Blocks with a predicted stall score: 47 (score removed: 28, reduced: 2, not reduced: 17). Blocks with a higher score after reordering (a stall moved to their head by the block before): 0
 
 | reason | blocks not reduced | % | all blocks with stalls left | % |
 |---|---|---|---|---|
@@ -61,9 +61,9 @@ Scheduled with ScheduleMode::Optimal (block-entry scoring). "total cycles" is th
 | loop | 10 | 10 | 3047 | 2362 | 22.48% |
 | mixed | 9 | 9 | 1798 | 1516 | 15.68% |
 
-Block numbers below are the scheduler's block score (stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions); remaining stalls are classified only where the optimizer proved them optimal.
+Block counts below use the scheduler's weighted block score (scoreBefore/scoreAfter: stalls per way into the block, loop entries weighted 10, plus stalls caused in the next block's first instructions), the objective the scheduler and optimizer minimize; plain predicted stalls are in blocks.csv (predicted_stalls_*). Remaining score is classified only where the optimizer proved it optimal.
 
-Blocks with predicted stalls: 116 (stalls removed: 13, reduced: 73, not reduced: 30). Blocks with more predicted stalls after reordering (a stall moved to their head by the block before): 2
+Blocks with a predicted stall score: 116 (score removed: 13, reduced: 73, not reduced: 30). Blocks with a higher score after reordering (a stall moved to their head by the block before): 2
 
 | reason | blocks not reduced | % | all blocks with stalls left | % |
 |---|---|---|---|---|

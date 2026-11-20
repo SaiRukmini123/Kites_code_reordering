@@ -55,11 +55,12 @@ std::vector<BlockOutcome> classify(const std::string &source, PipelineKind kind,
     return classifyBlocks(program, outcome.report, kind);
 }
 
+// The first block with a remaining stall score (what the classifier explains).
 const BlockOutcome *firstWithStallsLeft(const std::vector<BlockOutcome> &blocks)
 {
     for (const BlockOutcome &b : blocks)
     {
-        if (b.stallsAfter > 0)
+        if (b.scoreAfter > 0)
         {
             return &b;
         }
@@ -153,11 +154,13 @@ TEST(ReorderBenchEval, ClassifiesDependencyChain)
                            PipelineKind::HNF, {});
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
+    // One straight-line block entered only at program start: plain stalls and score agree.
     EXPECT_EQ(b->stallsAfter, 6);
+    EXPECT_EQ(b->scoreAfter, 6);
     EXPECT_TRUE(b->searched);
     EXPECT_TRUE(b->proven);
-    EXPECT_EQ(b->optimalStalls, 6);
-    EXPECT_EQ(b->greedyStalls, 6);
+    EXPECT_EQ(b->optimalScore, 6);
+    EXPECT_EQ(b->greedyScore, 6);
     EXPECT_EQ(b->reason, StallReason::DependencyChain);
 }
 
@@ -183,10 +186,10 @@ TEST(ReorderBenchEval, ProvenOptimalBlockGetsGraphReason)
                            PipelineKind::HNF, {});
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
-    EXPECT_LT(b->stallsAfter, b->stallsBefore);
+    EXPECT_LT(b->scoreAfter, b->scoreBefore);
     EXPECT_TRUE(b->proven);
     EXPECT_EQ(b->method, reorder::OptimizerMethod::Optimal);
-    EXPECT_EQ(b->optimalStalls, b->stallsAfter);
+    EXPECT_EQ(b->optimalScore, b->scoreAfter); // both scores: like for like
     EXPECT_NE(b->reason, StallReason::OtherNotProvenOptimal);
     EXPECT_NE(b->reason, StallReason::SchedulerMissedOptimum);
 }
@@ -223,12 +226,14 @@ TEST(ReorderBenchEval, ClassifiesSchedulerMissedOptimum)
     for (reorder::BlockStalls &bs : report.blocks)
     {
         bs.stallsAfter = bs.stallsBefore;
+        bs.scoreAfter = bs.scoreBefore;
     }
     const std::vector<BlockOutcome> blocks = classifyBlocks(program, report, PipelineKind::HF);
     const BlockOutcome *b = firstWithStallsLeft(blocks);
     ASSERT_NE(b, nullptr);
     EXPECT_EQ(b->stallsAfter, 1);
-    EXPECT_EQ(b->optimalStalls, 0);
+    EXPECT_EQ(b->scoreAfter, 1);
+    EXPECT_EQ(b->optimalScore, 0);
     EXPECT_EQ(b->reason, StallReason::SchedulerMissedOptimum);
 }
 
@@ -237,6 +242,7 @@ TEST(ReorderBenchEval, ClassifiesSchedulerMissedOptimum)
 TEST(ReorderBenchEval, RebuiltScoringMatchesScheduler)
 {
     size_t blocksChecked = 0;
+    size_t blocksWhereUnitsDiffer = 0;
     for (const auto &path : findPrograms("../bench/programs"))
     {
         const std::string source = readFile(path);
@@ -264,14 +270,20 @@ TEST(ReorderBenchEval, RebuiltScoringMatchesScheduler)
                         scheduled.push_back(reorder::decode(report.words[k]));
                     }
                     const auto scoring = schedulerScoring(program.text_buffer, report.words, blocks, entries, b);
-                    EXPECT_EQ(reorder::scoreOrder(scheduled, kind, scoring), report.blocks[b].stallsAfter)
+                    // The rebuilt scoring is the scheduler's objective, so it matches scoreAfter (the
+                    // weighted score), not stallsAfter (plain stalls; see reorder::BlockStalls).
+                    EXPECT_EQ(reorder::scoreOrder(scheduled, kind, scoring), report.blocks[b].scoreAfter)
                         << "block " << b;
+                    blocksWhereUnitsDiffer += report.blocks[b].scoreAfter != report.blocks[b].stallsAfter ? 1 : 0;
                     ++blocksChecked;
                 }
             }
         }
     }
     EXPECT_GT(blocksChecked, 100u);
+    // The loops in the benchmark set make the two units differ somewhere (otherwise this test
+    // could not tell scoreAfter from stallsAfter).
+    EXPECT_GT(blocksWhereUnitsDiffer, 0u);
 }
 
 TEST(ReorderBenchEval, ReasonNames)

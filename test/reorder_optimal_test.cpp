@@ -552,16 +552,16 @@ TEST(ReorderOptimal, NeverWorseThanGreedy_AllBlocks)
                 const ScheduleReport greedy = scheduleProgram(program.text_buffer, kind, leaders);
                 for (const BlockStalls &b : optimal.blocks)
                 {
-                    EXPECT_LE(b.stallsAfter, b.greedyStalls) << p.name << " block at " << b.block.begin;
-                    EXPECT_EQ(b.stallsAfter, b.optimalStalls) << p.name;
+                    EXPECT_LE(b.scoreAfter, b.greedyStalls) << p.name << " block at " << b.block.begin;
+                    EXPECT_EQ(b.scoreAfter, b.optimalStalls) << p.name;
                 }
                 const OptimalSummary s = summarizeOptimal(optimal);
                 addInto(total, s);
-                greedyModeTotal += greedy.stallsAfter;
+                greedyModeTotal += greedy.scoreAfter;
                 if (set.programs.size() <= 10)
                 {
                     printSummary(std::string(set.name) + " " + p.name + " (" + pipelineName(kind) + ")", s,
-                                 greedy.stallsAfter);
+                                 greedy.scoreAfter);
                 }
             }
             printSummary(std::string(set.name) + " total (" + pipelineName(kind) + ")", total, greedyModeTotal);

@@ -424,28 +424,36 @@ inline const char *stallReasonName(StallReason reason)
     return "?";
 }
 
-// One block with predicted stalls before or after scheduling. Stall numbers are the scheduler's
-// block score (scheduler.h, ContextMode::BlockEntries): stalls under each way into the block,
-// weighted by that entry edge (loop edges count kDefaultLoopWeight), plus the stalls the block
-// causes in the next block's first instructions. For a straight-line block entered only at
-// program start this is the plain predicted stall count.
+// One block with a predicted stall score before or after scheduling. Two units, as in
+// reorder::BlockStalls:
+//  - stallsBefore/stallsAfter: plain predicted stalls (one context, no weights, no tail);
+//  - scoreBefore/scoreAfter: the weighted objective the scheduler minimizes (ContextMode::
+//    BlockEntries): stalls under each way into the block times that entry edge's weight (loop
+//    edges count kDefaultLoopWeight), plus the weighted stalls the block causes in the next
+//    block's first instructions. For a straight-line block entered only at program start the two
+//    are equal.
+// Status, the reason split and the optimizer comparison use the score (what the scheduler and the
+// optimizer minimize); the plain stalls are reported alongside.
 struct BlockOutcome
 {
     reorder::Block block{};
     unsigned firstLine = 0;
     unsigned lastLine = 0;
-    int stallsBefore = 0;
+    int stallsBefore = 0; // plain
     int stallsAfter = 0;
-    std::string status;   // improved | partial | unimproved | worse (a stall added at the head
-                          // because the block before it was reordered)
+    int scoreBefore = 0;  // weighted
+    int scoreAfter = 0;
+    std::string status;   // by score: improved | partial | unimproved | worse (a stall added at the
+                          // head because the block before it was reordered)
     bool hasReason = false;
     StallReason reason = StallReason::NothingIndependent; // reason for most of the remaining score
     std::map<StallReason, int> stallCyclesByReason;      // the remaining score, split by reason
 
-    // From scheduleBlockOptimalDetailed() (blocks with stalls left only).
+    // From scheduleBlockOptimalDetailed() with the scheduler's own scoring (blocks with a score
+    // left only), so both are in score units like scoreAfter.
     bool searched = false;
-    int optimalStalls = -1;
-    int greedyStalls = -1;
+    int optimalScore = -1;
+    int greedyScore = -1;
     reorder::OptimizerMethod method = reorder::OptimizerMethod::NotSearched;
     bool proven = false;
 };
@@ -554,7 +562,8 @@ inline reorder::BlockScoring schedulerScoring(const std::vector<uint32_t> &origi
                                               const std::vector<uint32_t> &scheduledWords,
                                               const std::vector<reorder::Block> &blocks,
                                               const std::vector<reorder::BlockEntry> &entries,
-                                              size_t b)
+                                              size_t b,
+                                              reorder::HazardModel model = reorder::HazardModel::Exact)
 {
     const reorder::Block &block = blocks[b];
     reorder::DecodedInst prev1{}, prev2{};
@@ -571,6 +580,7 @@ inline reorder::BlockScoring schedulerScoring(const std::vector<uint32_t> &origi
     }
     const reorder::BlockEntry &entry = entries[b];
     reorder::BlockScoring scoring;
+    scoring.model = model;
     if (entry.fallThrough)
     {
         scoring.heads.push_back(reorder::ScoredHead{reorder::windowFrom(ctx), entry.fallThroughWeight});
@@ -662,17 +672,19 @@ inline StallReason graphReason(const std::vector<reorder::DecodedInst> &original
 }
 
 // The reason for one remaining stall, given the optimizer's verdict on its block:
+// `achievedScore` is the schedule's scoreAfter: the same units as optimum.optimalStalls (a score,
+// because the optimizer is called with the scheduler's BlockScoring).
 //  - it found a lower score than the schedule      -> SchedulerMissedOptimum
 //  - it did not prove the block optimal            -> OtherNotProvenOptimal
 //  - proven optimal                                -> a reason from the dependency graph
-inline StallReason classifyStall(const reorder::OptimalBlockResult &optimum, int achieved,
+inline StallReason classifyStall(const reorder::OptimalBlockResult &optimum, int achievedScore,
                                  const std::vector<reorder::DecodedInst> &originalInsts,
                                  const reorder::DepGraph &graph,
                                  const std::vector<reorder::DecodedInst> &scheduledInsts,
                                  const std::vector<size_t> &originalLocalOf, size_t stalled,
                                  PipelineKind kind)
 {
-    if (optimum.optimalStalls < achieved)
+    if (optimum.optimalStalls < achievedScore)
     {
         return StallReason::SchedulerMissedOptimum;
     }
@@ -701,7 +713,7 @@ inline std::vector<BlockOutcome> classifyBlocks(const AssembledProgram &program,
     for (size_t b = 0; b < report.blocks.size() && b < blocks.size(); ++b)
     {
         const reorder::BlockStalls &bs = report.blocks[b];
-        if (bs.stallsBefore == 0 && bs.stallsAfter == 0)
+        if (bs.scoreBefore == 0 && bs.scoreAfter == 0 && bs.stallsBefore == 0 && bs.stallsAfter == 0)
         {
             continue;
         }
@@ -712,11 +724,13 @@ inline std::vector<BlockOutcome> classifyBlocks(const AssembledProgram &program,
         outcome.lastLine = reorder::sourceLineOf(program, block.end - 1);
         outcome.stallsBefore = bs.stallsBefore;
         outcome.stallsAfter = bs.stallsAfter;
-        outcome.status = bs.stallsAfter > bs.stallsBefore    ? "worse"
-                         : bs.stallsAfter == 0                ? "improved"
-                         : bs.stallsAfter < bs.stallsBefore ? "partial"
-                                                              : "unimproved";
-        if (bs.stallsAfter > 0)
+        outcome.scoreBefore = bs.scoreBefore;
+        outcome.scoreAfter = bs.scoreAfter;
+        outcome.status = bs.scoreAfter > bs.scoreBefore    ? "worse"
+                         : bs.scoreAfter == 0               ? "improved"
+                         : bs.scoreAfter < bs.scoreBefore ? "partial"
+                                                            : "unimproved";
+        if (bs.scoreAfter > 0)
         {
             std::vector<reorder::DecodedInst> originalInsts, scheduledInsts;
             std::vector<size_t> originalLocalOf;
@@ -730,8 +744,8 @@ inline std::vector<BlockOutcome> classifyBlocks(const AssembledProgram &program,
             const reorder::OptimalBlockResult optimum =
                 reorder::scheduleBlockOptimalDetailed(words, block, kind, scoring);
             outcome.searched = true;
-            outcome.optimalStalls = optimum.optimalStalls;
-            outcome.greedyStalls = optimum.greedyStalls;
+            outcome.optimalScore = optimum.optimalStalls; // a score: see OptimalBlockResult
+            outcome.greedyScore = optimum.greedyStalls;
             outcome.method = optimum.method;
             outcome.proven = optimum.provenOptimal();
 
@@ -743,11 +757,11 @@ inline std::vector<BlockOutcome> classifyBlocks(const AssembledProgram &program,
                 reorder::WindowState window = head.window;
                 for (size_t k = 0; k < scheduledInsts.size(); ++k)
                 {
-                    const int stalls = reorder::issue(window, scheduledInsts[k], kind);
+                    const int stalls = reorder::issue(window, scheduledInsts[k], kind, scoring.model);
                     if (stalls > 0)
                     {
                         const StallReason reason =
-                            classifyStall(optimum, bs.stallsAfter, originalInsts, graph, scheduledInsts,
+                            classifyStall(optimum, bs.scoreAfter, originalInsts, graph, scheduledInsts,
                                           originalLocalOf, k, kind);
                         outcome.stallCyclesByReason[reason] += head.weight * stalls;
                     }
@@ -755,12 +769,12 @@ inline std::vector<BlockOutcome> classifyBlocks(const AssembledProgram &program,
                 int tailStalls = 0;
                 for (const reorder::DecodedInst &d : scoring.tail)
                 {
-                    tailStalls += reorder::issue(window, d, kind);
+                    tailStalls += reorder::issue(window, d, kind, scoring.model);
                 }
                 if (tailStalls > 0)
                 {
                     const StallReason reason =
-                        optimum.optimalStalls < bs.stallsAfter ? StallReason::SchedulerMissedOptimum
+                        optimum.optimalStalls < bs.scoreAfter ? StallReason::SchedulerMissedOptimum
                         : !optimum.provenOptimal()             ? StallReason::OtherNotProvenOptimal
                                                                : StallReason::BlockBoundary;
                     outcome.stallCyclesByReason[reason] += scoring.tailWeight * tailStalls;
@@ -885,19 +899,22 @@ void runOptimalWithSafetyNet(const AssembledProgram &program, PipelineKind kind,
     row.originalHitCap = net.originalHitCap;
 }
 
-inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
-                         const std::function<void(const std::string &)> &progress = {})
+// A program that passed the validity filter and is not a near-duplicate of an earlier one.
+struct UsableProgram
 {
-    BenchRun run;
-    struct Usable
-    {
-        size_t filterIndex;
-        AssembledProgram program;
-        Seed seed;
-        std::vector<std::string> shape;
-    };
-    std::vector<Usable> usable;
+    size_t filterIndex = 0; // into the FilterRow list filterPrograms() filled
+    AssembledProgram program;
+    Seed seed;              // the inputs its header declares
+    std::vector<std::string> shape;
+};
 
+// The validity filter and near-duplicate removal over `paths`: one FilterRow per path appended to
+// `filter`, and the usable programs returned (shared by reorder-bench and reorder-fuzz).
+inline std::vector<UsableProgram> filterPrograms(const std::vector<std::filesystem::path> &paths,
+                                                 std::vector<FilterRow> &filter,
+                                                 const std::function<void(const std::string &)> &progress = {})
+{
+    std::vector<UsableProgram> usable;
     for (const auto &path : paths)
     {
         FilterRow row;
@@ -917,7 +934,7 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         {
             row.problems.push_back("label named '" + hangLabel +
                                    "' (a section directive): the Kites assembler hangs on it");
-            run.filter.push_back(row);
+            filter.push_back(row);
             continue;
         }
         AssembledProgram program;
@@ -928,7 +945,7 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         catch (const std::exception &e)
         {
             row.problems.push_back(std::string("does not assemble: ") + e.what());
-            run.filter.push_back(row);
+            filter.push_back(row);
             continue;
         }
         row.instructions = program.text_buffer.size();
@@ -944,23 +961,31 @@ inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
         if (row.valid)
         {
             const std::vector<std::string> shape = mnemonicSequence(program.text_buffer);
-            for (const Usable &u : usable)
+            for (const UsableProgram &u : usable)
             {
                 if (shapeSimilarity(shape, u.shape) >= kDuplicateThreshold)
                 {
-                    row.duplicateOf = run.filter[u.filterIndex].name;
+                    row.duplicateOf = filter[u.filterIndex].name;
                     break;
                 }
             }
             if (row.duplicateOf.empty())
             {
-                usable.push_back({run.filter.size(), program, seed, shape});
+                usable.push_back({filter.size(), program, seed, shape});
             }
         }
-        run.filter.push_back(row);
+        filter.push_back(row);
     }
+    return usable;
+}
 
-    for (const Usable &u : usable)
+inline BenchRun runBench(const std::vector<std::filesystem::path> &paths,
+                         const std::function<void(const std::string &)> &progress = {})
+{
+    BenchRun run;
+    const std::vector<UsableProgram> usable = filterPrograms(paths, run.filter, progress);
+
+    for (const UsableProgram &u : usable)
     {
         const FilterRow &f = run.filter[u.filterIndex];
         for (PipelineKind kind : {PipelineKind::HF, PipelineKind::HNF})
@@ -1050,7 +1075,8 @@ inline std::string resultsCsv(const BenchRun &run)
     std::ostringstream out;
     out << "program,category,source,vm,instructions,retired_before,retired_after,cycles_before,"
            "cycles_after,cycles_saved,reduction_pct,stalls_before,stalls_after,"
-           "predicted_stalls_before,predicted_stalls_after,cpi_before,cpi_after,moves,"
+           "predicted_stalls_before,predicted_stalls_after,predicted_score_before,"
+           "predicted_score_after,cpi_before,cpi_after,moves,"
            "equivalent,faster,hit_cap,kept,kept_cycles,safety_net_fell_back,blocks_tried,"
            "blocks_rejected\n";
     for (const ResultRow &r : run.results)
@@ -1062,7 +1088,8 @@ inline std::string resultsCsv(const BenchRun &run)
             << static_cast<long long>(o.before.cycles) - static_cast<long long>(o.after.cycles)
             << ',' << fixed(reductionPercent(o.before.cycles, o.after.cycles), 2) << ','
             << o.before.stalls << ',' << o.after.stalls << ',' << o.report.stallsBefore << ','
-            << o.report.stallsAfter << ',' << reorder_report::formatCpi(o.before.cycles, o.before.retired)
+            << o.report.stallsAfter << ',' << o.report.scoreBefore << ',' << o.report.scoreAfter << ','
+            << reorder_report::formatCpi(o.before.cycles, o.before.retired)
             << ',' << reorder_report::formatCpi(o.after.cycles, o.after.retired) << ','
             << o.report.moves.size() << ',' << (o.equivalent ? "yes" : "no") << ','
             << (o.after.cycles < o.before.cycles ? "yes" : "no") << ','
@@ -1077,17 +1104,19 @@ inline std::string blocksCsv(const BenchRun &run)
 {
     std::ostringstream out;
     out << "program,category,vm,first_line,last_line,instructions,predicted_stalls_before,"
-           "predicted_stalls_after,optimal_stalls,greedy_stalls,method,proven,status,reason,"
-           "stall_cycles_by_reason\n";
+           "predicted_stalls_after,score_before,score_after,optimal_score,greedy_score,method,"
+           "proven,status,reason,"
+           "score_by_reason\n";
     for (const ResultRow &r : run.results)
     {
         for (const BlockOutcome &b : r.blocks)
         {
             out << csvField(r.name) << ',' << r.category << ',' << reorder_report::vmName(r.kind)
                 << ',' << b.firstLine << ',' << b.lastLine << ',' << (b.block.end - b.block.begin)
-                << ',' << b.stallsBefore << ',' << b.stallsAfter << ','
-                << (b.searched ? std::to_string(b.optimalStalls) : std::string("")) << ','
-                << (b.searched ? std::to_string(b.greedyStalls) : std::string("")) << ','
+                << ',' << b.stallsBefore << ',' << b.stallsAfter << ',' << b.scoreBefore << ','
+                << b.scoreAfter << ','
+                << (b.searched ? std::to_string(b.optimalScore) : std::string("")) << ','
+                << (b.searched ? std::to_string(b.greedyScore) : std::string("")) << ','
                 << (b.searched ? csvField(reorder::optimizerMethodName(b.method)) : std::string(""))
                 << ',' << (b.searched ? (b.proven ? "yes" : "no") : "") << ',' << b.status << ',' << (b.hasReason ? stallReasonName(b.reason) : "") << ',';
             std::string breakdown;
@@ -1233,7 +1262,7 @@ inline std::string summaryMarkdown(const BenchRun &run)
                 {
                     ++worseBlocks;
                 }
-                if (b.stallsBefore == 0)
+                if (b.scoreBefore == 0)
                 {
                     continue;
                 }
@@ -1264,13 +1293,16 @@ inline std::string summaryMarkdown(const BenchRun &run)
                 }
             }
         }
-        out << "\nBlock numbers below are the scheduler's block score (stalls per way into the "
-               "block, loop entries weighted " << reorder::kDefaultLoopWeight
-            << ", plus stalls caused in the next block's first instructions); remaining stalls are "
-               "classified only where the optimizer proved them optimal.\n";
-        out << "\nBlocks with predicted stalls: " << stalledBlocks << " (stalls removed: "
+        out << "\nBlock counts below use the scheduler's weighted block score (scoreBefore/"
+               "scoreAfter: stalls per way into the block, loop entries weighted "
+            << reorder::kDefaultLoopWeight
+            << ", plus stalls caused in the next block's first instructions), the objective the "
+               "scheduler and optimizer minimize; plain predicted stalls are in blocks.csv "
+               "(predicted_stalls_*). Remaining score is classified only where the optimizer proved "
+               "it optimal.\n";
+        out << "\nBlocks with a predicted stall score: " << stalledBlocks << " (score removed: "
             << improvedBlocks << ", reduced: " << partialBlocks
-            << ", not reduced: " << unimprovedBlocks << "). Blocks with more predicted stalls after"
+            << ", not reduced: " << unimprovedBlocks << "). Blocks with a higher score after"
             << " reordering (a stall moved to their head by the block before): " << worseBlocks
             << "\n\n";
         out << "| reason | blocks not reduced | % | all blocks with stalls left | % |\n";

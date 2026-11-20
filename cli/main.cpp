@@ -42,7 +42,11 @@ void printUsage(const char *programName)
         << "  reorder         schedule for the hazard pipeline, run original and reordered,\n"
         << "                  and compare (see '" << programName << " reorder --help')\n"
         << "       " << programName << " reorder-bench <programs-dir> [--out <dir>]\n"
-        << "  reorder-bench   validity filter + batch run, writes CSVs and a summary\n";
+        << "  reorder-bench   validity filter + batch run, writes CSVs and a summary\n"
+        << "       " << programName
+        << " reorder-fuzz [--count N] [--seed S] [--programs DIR] [--random R] [--only NAME]\n"
+        << "                  [--generator v1|v2] [--checks basic|all] [--optimizer-table]\n"
+        << "  reorder-fuzz    original vs reordered from random starting registers and memory\n";
 }
 
 const std::unordered_map<std::string, Kites::ProcessorType> processorTypes = {
@@ -67,6 +71,10 @@ int main(int argc, char *argv[])
     if (argc >= 2 && std::string(argv[1]) == "reorder-bench")
     {
         return Kites::RunReorderBenchCommand(argc, argv);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "reorder-fuzz")
+    {
+        return Kites::RunReorderFuzzCommand(argc, argv);
     }
 
     std::string assemblyFile;
