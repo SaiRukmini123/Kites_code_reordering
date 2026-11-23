@@ -36,6 +36,12 @@ ReorderListingEditor::ReorderListingEditor(QWidget *parent) : KitesEditor(parent
 
 QColor ReorderListingEditor::linkColor(int colorIndex)
 {
+    if (colorIndex == kInsertedColorIndex)
+    {
+        QColor inserted = QColor::fromHsv(120, 110, 245);
+        inserted.setAlphaF(kInsertedAlpha);
+        return inserted;
+    }
     // 12 hues ordered so that consecutive indices (the usual neighbours in a listing) are far
     // apart on the colour wheel; after 12 links the sequence repeats and the gutter labels still
     // name the partner line.

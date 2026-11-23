@@ -2,8 +2,10 @@
 #include "assembler/assembler.h"
 #include "common/globals.h"
 #include "custom_pseudo_manager/custom_pseudo_manager.h"
+#include "reorder/loop_unroll.h"
 #include "reorder_listing_editor.h"
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -24,7 +26,9 @@
 #include <algorithm>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <set>
+#include <sstream>
 
 namespace Kites
 {
@@ -53,6 +57,80 @@ struct WaitCursorGuard
     WaitCursorGuard(const WaitCursorGuard &) = delete;
     WaitCursorGuard &operator=(const WaitCursorGuard &) = delete;
 };
+
+// One sentence per line. The unrolled legend replaces the move sentences, since moves do not map
+// onto a listing with inserted lines.
+const char *kMovesLegend = "Each moved line has its own colour, the same on both sides.\n"
+                           "\u2192 N in the original gutter is the line it moved to.\n"
+                           "\u2190 N in the suggested gutter is the line it came from.\n"
+                           "+N: predicted stall cycles before that line's instruction.";
+const char *kUnrolledLegend = "Unrolled mode shows inserted lines instead of moves.\n"
+                              "Lines added by unrolling are highlighted, marked \"new\" in the "
+                              "suggested gutter.\n"
+                              "Inside every copy the instructions are also reordered.\n"
+                              "+N: predicted stall cycles before that line's instruction.";
+
+// The lines of `unrolled` that unrollSource() added to `original`: it only inserts lines (the
+// copies, the inverted branches, the exit labels), so walking both in order finds them. Empty
+// when `unrolled` is not `original` plus inserted lines.
+std::map<unsigned, ListingLineLink> insertedLineLinks(const std::string &original,
+                                                      const std::string &unrolled)
+{
+    const std::vector<std::string> before = reorder::splitLines(original);
+    const std::vector<std::string> after = reorder::splitLines(unrolled);
+    std::map<unsigned, ListingLineLink> links;
+    size_t next = 0; // the next line of `original` still to be found
+    for (size_t i = 0; i < after.size(); ++i)
+    {
+        if (next < before.size() && after[i] == before[next])
+        {
+            ++next;
+        }
+        else if (!reorder_report::trimSpaces(after[i]).empty())
+        {
+            links[static_cast<unsigned>(i + 1)] = {ReorderListingEditor::kInsertedColorIndex,
+                                                   "new"};
+        }
+    }
+    if (next != before.size())
+    {
+        return {};
+    }
+    return links;
+}
+
+reorder::UnrollOutcome unrollOn(const std::string &source, const AssembledProgram &program,
+                                const Seed &seed, PipelineKind kind, unsigned cap)
+{
+    if (kind == PipelineKind::HF)
+    {
+        return reorder::unrollAndReorder<RV5StageProcessorHF>(source, program, seed, kind, cap);
+    }
+    return reorder::unrollAndReorder<RV5StageProcessorHNF>(source, program, seed, kind, cap);
+}
+
+// Verify for the unrolled program: the same runs and verdict data as runReorder(), with the
+// unrolled program as the suggested one.
+template <class VM>
+reorder_report::ReorderOutcome compareRuns(const AssembledProgram &original,
+                                           const AssembledProgram &suggested, PipelineKind kind,
+                                           const Seed &seed, unsigned cap)
+{
+    reorder_report::ReorderOutcome outcome;
+    outcome.kind = kind;
+    outcome.cycleCap = cap;
+    outcome.original = original;
+    outcome.reordered = suggested;
+    outcome.before = runProgram<VM>(original, seed, cap, reorder_report::kDataWindowWords);
+    outcome.after = runProgram<VM>(suggested, seed, cap, reorder_report::kDataWindowWords);
+    outcome.equivalent = sameState(outcome.before, outcome.after);
+    return outcome;
+}
+
+QString cyclesText(const RunResult &run, unsigned cap)
+{
+    return run.hitCap ? QString("hit the cycle cap (%1)").arg(cap) : QString::number(run.cycles);
+}
 
 // One colour per moved source line, shared by its line in the original listing and the line(s)
 // it ended up on in the suggested listing, plus "-> N" / "<- N" labels naming the partner lines.
@@ -166,17 +244,13 @@ void ReorderDialog::buildUi(ProcessorType currentVm)
     QLabel *originalHeading = nullptr;
     makePane("Original", m_originalView, originalHeading);
     makePane("Suggested", m_suggestedView, m_suggestedHeading);
+    m_originalView->setObjectName("originalView");
+    m_suggestedView->setObjectName("suggestedView");
     layout->addWidget(splitter, 1);
-    // One sentence per line.
-    auto *legend = new QLabel(QString::fromUtf8(
-                                  "Each moved line has its own colour, the same on both sides.\n"
-                                  "\u2192 N in the original gutter is the line it moved to.\n"
-                                  "\u2190 N in the suggested gutter is the line it came from.\n"
-                                  "+N: predicted stall cycles before that line's instruction."),
-                              this);
-    legend->setObjectName("legendLabel");
-    legend->setTextFormat(Qt::PlainText);
-    layout->addWidget(legend);
+    m_legendLabel = new QLabel(QString::fromUtf8(kMovesLegend), this);
+    m_legendLabel->setObjectName("legendLabel");
+    m_legendLabel->setTextFormat(Qt::PlainText);
+    layout->addWidget(m_legendLabel);
 
     // Predicted stalls per block.
     m_blockTable = new QTableWidget(0, 3, this);
@@ -190,6 +264,21 @@ void ReorderDialog::buildUi(ProcessorType currentVm)
     m_blockTable->setSelectionMode(QAbstractItemView::NoSelection);
     m_blockTable->setMaximumHeight(150);
     layout->addWidget(m_blockTable);
+
+    // Opt-in loop unrolling, and what it did.
+    m_unrollCheck = new QCheckBox("Also try loop unrolling", this);
+    m_unrollCheck->setObjectName("unrollCheck");
+    m_unrollCheck->setToolTip("Unroll eligible loops 2 or 4 times, reorder every copy, and keep "
+                              "the result only if it runs faster on the VM with the same final "
+                              "state (uses the Seed and Cycle cap below)");
+    layout->addWidget(m_unrollCheck);
+    m_unrollLabel = new QLabel(this);
+    m_unrollLabel->setObjectName("unrollLabel");
+    m_unrollLabel->setTextFormat(Qt::RichText); // every inserted string is HTML-escaped
+    m_unrollLabel->setWordWrap(true);
+    m_unrollLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_unrollLabel->setVisible(false);
+    layout->addWidget(m_unrollLabel);
 
     // Verification on the VM.
     auto *verifyRow = new QHBoxLayout();
@@ -228,13 +317,29 @@ void ReorderDialog::buildUi(ProcessorType currentVm)
     connect(m_applyButton, &QPushButton::clicked, this,
             [this]()
             {
-                if (m_analysis)
+                if (m_unrolledProgram)
+                {
+                    emit applyRequested(QString::fromStdString(m_unrolledText));
+                    accept();
+                }
+                else if (m_analysis)
                 {
                     emit applyRequested(QString::fromStdString(m_analysis->reorderedSource));
                     accept();
                 }
             });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(m_unrollCheck, &QCheckBox::toggled, this, &ReorderDialog::analyze);
+    // The unrolling is checked with the Seed and Cycle cap, so it is redone when they change.
+    auto reanalyzeIfUnrolling = [this]()
+    {
+        if (m_unrollCheck->isChecked() && !m_verifying)
+        {
+            analyze();
+        }
+    };
+    connect(m_seedEdit, &QLineEdit::editingFinished, this, reanalyzeIfUnrolling);
+    connect(m_capSpin, &QSpinBox::editingFinished, this, reanalyzeIfUnrolling);
 }
 
 void ReorderDialog::assembleEditorText()
@@ -302,6 +407,7 @@ void ReorderDialog::setControlsEnabled(bool enabled)
     m_verifyButton->setEnabled(enabled);
     m_seedEdit->setEnabled(enabled);
     m_capSpin->setEnabled(enabled);
+    m_unrollCheck->setEnabled(enabled);
     m_applyButton->setEnabled(enabled);
 }
 
@@ -379,7 +485,15 @@ void ReorderDialog::analyze()
                       .arg(a.report.moves.size());
     }
 
-    bool canApply = a.hasImprovement() && a.roundTripOk;
+    // Opt-in loop unrolling replaces the suggested side (and the summary) when it keeps a loop.
+    m_unrolledText.clear();
+    m_unrolledProgram.reset();
+    m_legendLabel->setText(QString::fromUtf8(kMovesLegend));
+    m_unrollLabel->clear();
+    m_unrollLabel->setVisible(m_unrollCheck->isChecked());
+    const bool unrolled = m_unrollCheck->isChecked() && tryLoopUnrolling(kind, summary);
+
+    bool canApply = unrolled || (a.hasImprovement() && a.roundTripOk);
     QString applyNote;
     if (m_expandedText != m_editorText)
     {
@@ -387,7 +501,7 @@ void ReorderDialog::analyze()
         applyNote = "Apply is off: the program uses custom pseudo-instructions, and applying "
                     "would replace them with their expansion.";
     }
-    else if (a.hasImprovement() && !a.roundTripOk)
+    else if (!unrolled && a.hasImprovement() && !a.roundTripOk)
     {
         applyNote = "Apply is off: the suggested source did not re-assemble to the same "
                     "instructions.";
@@ -397,10 +511,152 @@ void ReorderDialog::analyze()
         summary += "<br>" + applyNote;
     }
     m_summaryLabel->setText(summary);
+    m_canApply = canApply;
+    m_applyNote = applyNote;
     m_applyButton->setEnabled(canApply);
     m_applyButton->setToolTip(applyNote);
     m_verifyButton->setEnabled(true);
     m_verifyLabel->clear();
+}
+
+bool ReorderDialog::tryLoopUnrolling(PipelineKind kind, QString &summary)
+{
+    const QString vm = QString::fromLatin1(reorder_report::vmName(kind));
+    const unsigned cap = static_cast<unsigned>(m_capSpin->value());
+    const QString heading = "<b>Loop unrolling:</b> ";
+    Seed seed;
+    try
+    {
+        seed = reorder_report::parseSeed(m_seedEdit->text().toStdString()); // empty: default
+    }
+    catch (const std::exception &e)
+    {
+        const QString reason = QString::fromStdString(e.what()).toHtmlEscaped();
+        m_unrollLabel->setText(
+            heading +
+            QString("not tried, invalid seed: %1. Showing the reorder-only result.").arg(reason));
+        return false;
+    }
+
+    m_unrollLabel->setText(heading + QString("running on %1...").arg(vm));
+    m_unrollLabel->repaint();
+    std::optional<reorder::UnrollOutcome> outcome;
+    QString failure;
+    {
+        WaitCursorGuard waitCursor; // several VM runs, each bounded by the Cycle cap
+        try
+        {
+            outcome = unrollOn(m_expandedText, *m_program, seed, kind, cap);
+        }
+        catch (const std::exception &e)
+        {
+            failure = QString::fromStdString(e.what());
+        }
+        catch (...)
+        {
+            failure = "unknown error";
+        }
+    }
+    if (!outcome)
+    {
+        m_unrollLabel->setText(heading + QString("could not run: %1. Showing the reorder-only "
+                                                 "result.")
+                                             .arg(failure.toHtmlEscaped()));
+        return false;
+    }
+    const reorder::UnrollOutcome &o = *outcome;
+
+    // The kept program, written in the editor's layout (the unrolled source, reordered); it must
+    // re-assemble to exactly the instructions the library checked.
+    QString why;
+    if (o.unrolled)
+    {
+        try
+        {
+            m_unrolledText =
+                reorder_report::writeReorderedSource(o.finalSource, o.finalProgram, o.finalReport);
+            std::istringstream stream(m_unrolledText);
+            m_unrolledProgram = assemble(stream);
+            if (m_unrolledProgram->text_buffer != o.finalReport.words)
+            {
+                why = "the unrolled source did not re-assemble to the checked instructions";
+            }
+        }
+        catch (const std::exception &e)
+        {
+            why = QString("the unrolled source could not be written: %1")
+                      .arg(QString::fromStdString(e.what()));
+        }
+        if (!why.isEmpty())
+        {
+            m_unrolledText.clear();
+            m_unrolledProgram.reset();
+        }
+    }
+    else if (o.loops.empty() && o.ineligible.empty())
+    {
+        why = "the program has no loop";
+    }
+    else if (o.loops.empty())
+    {
+        why = "no loop is eligible";
+    }
+    else if (o.original.hitCap)
+    {
+        why = "the original program hit the cycle cap";
+    }
+    else
+    {
+        why = "no loop was worth unrolling or passed the check";
+    }
+    const bool kept = m_unrolledProgram.has_value();
+
+    QString text = heading;
+    if (kept)
+    {
+        text += QString("%1. ").arg(QString::fromStdString(o.note).toHtmlEscaped());
+    }
+    else
+    {
+        text += QString("nothing kept, showing the reorder-only result: %1. ")
+                    .arg(why.toHtmlEscaped());
+    }
+    text += QString("Cycles on %1: %2 (original) &rarr; %3 (%4).")
+                .arg(vm, cyclesText(o.original, cap), cyclesText(o.final_, cap),
+                     kept ? "unrolled and reordered" : "reorder-only");
+    std::istringstream suggestions(reorder::unrollSuggestions(o));
+    for (std::string line; std::getline(suggestions, line);)
+    {
+        text += "<br>" + QString::fromStdString(line).toHtmlEscaped();
+    }
+    m_unrollLabel->setText(text);
+    if (!kept)
+    {
+        return false;
+    }
+
+    // Moves do not map onto inserted lines: show the inserted lines instead.
+    std::vector<size_t> identity(m_unrolledProgram->text_buffer.size());
+    std::iota(identity.begin(), identity.end(), size_t{0});
+    const reorder_report::ListingMarks marks =
+        reorder_report::listingMarks(*m_unrolledProgram, identity, kind);
+    // writeReorderedSource() keeps the line layout of the unrolled source, so its inserted lines
+    // are at the same line numbers.
+    std::map<unsigned, ListingLineLink> inserted;
+    if (reorder::splitLines(m_unrolledText).size() == reorder::splitLines(o.finalSource).size())
+    {
+        inserted = insertedLineLinks(m_expandedText, o.finalSource);
+    }
+    m_originalView->setListing(QString::fromStdString(m_expandedText), {},
+                               m_analysis->originalMarks.stallsByLine);
+    m_suggestedView->setListing(QString::fromStdString(m_unrolledText), inserted,
+                                marks.stallsByLine);
+    m_suggestedHeading->setText(QString("Suggested for %1 (loops unrolled)").arg(vm));
+    m_legendLabel->setText(QString::fromUtf8(kUnrolledLegend));
+    summary = QString("<b>Unrolled and reordered for %1</b> (checked on the VM; see the loop "
+                      "unrolling summary below). Click Verify to compare final state.")
+                  .arg(vm);
+    return true;
 }
 
 void ReorderDialog::verify()
@@ -443,7 +699,18 @@ void ReorderDialog::verify()
             WaitCursorGuard waitCursor;
             try
             {
-                outcome = reorder_report::runReorder(program, kind, seed, cap);
+                if (m_unrolledProgram)
+                {
+                    const AssembledProgram unrolled = *m_unrolledProgram;
+                    outcome =
+                        kind == PipelineKind::HF
+                            ? compareRuns<RV5StageProcessorHF>(program, unrolled, kind, seed, cap)
+                            : compareRuns<RV5StageProcessorHNF>(program, unrolled, kind, seed, cap);
+                }
+                else
+                {
+                    outcome = reorder_report::runReorder(program, kind, seed, cap);
+                }
             }
             catch (const std::exception &e)
             {
@@ -458,7 +725,9 @@ void ReorderDialog::verify()
         m_verifying = false;
         m_verifyButton->setText("Verify");
         setControlsEnabled(true);
-        analyze(); // restores the Apply state (and clears the verify label)
+        // Restore the Apply state of the last analysis (re-analysing would redo the unrolling).
+        m_applyButton->setEnabled(m_canApply);
+        m_applyButton->setToolTip(m_applyNote);
         if (!outcome)
         {
             m_verifyLabel->setText(
