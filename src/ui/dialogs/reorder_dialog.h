@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -26,6 +27,11 @@ class ReorderListingEditor;
 // scene, which holds widgets, and widgets may only be created on the GUI thread (on macOS a
 // worker thread creating one aborts the app). The dialog shows "Verifying..." and blocks input
 // while the run is bounded by the Cycle cap.
+//
+// "Also try loop unrolling" (off by default) runs unrollAndReorder() with the Seed and Cycle cap
+// when the suggestion is made, on the GUI thread for the same reason. When an unrolled program
+// passes the library's VM check, the suggested side shows it (inserted lines highlighted instead
+// of moves), Verify compares it with the original, and Apply writes it to the editor.
 class ReorderDialog : public QDialog
 {
     Q_OBJECT
@@ -52,12 +58,20 @@ private:
     void setControlsEnabled(bool enabled);
     reorder::PipelineKind selectedKind() const;
     void showVerifyResult(const reorder_report::ReorderOutcome &outcome);
+    // Runs the unrolling for the current pipeline, Seed and Cycle cap. On success fills the
+    // suggested listing and the m_unrolled* members and returns true; otherwise leaves the
+    // reorder-only listing in place. Either way the unrolling summary explains the result.
+    bool tryLoopUnrolling(reorder::PipelineKind kind, QString &summary);
 
     std::string m_editorText;   // exactly as in the editor
     std::string m_expandedText; // after custom pseudo-instruction expansion (what gets assembled)
     bool m_assemblyFailed = false;
     std::optional<AssembledProgram> m_program;
     std::optional<reorder_report::ReorderAnalysis> m_analysis;
+    std::string m_unrolledText;                  // unrolled + reordered source, when kept
+    std::optional<AssembledProgram> m_unrolledProgram; // m_unrolledText assembled
+    bool m_canApply = false;                     // Apply state after the last analysis
+    QString m_applyNote;
 
     QComboBox *m_vmCombo = nullptr;
     QLabel *m_vmNote = nullptr;
@@ -66,6 +80,9 @@ private:
     ReorderListingEditor *m_originalView = nullptr;
     ReorderListingEditor *m_suggestedView = nullptr;
     QTableWidget *m_blockTable = nullptr;
+    QLabel *m_legendLabel = nullptr;
+    QCheckBox *m_unrollCheck = nullptr;
+    QLabel *m_unrollLabel = nullptr;
     QLineEdit *m_seedEdit = nullptr;
     QSpinBox *m_capSpin = nullptr;
     QPushButton *m_verifyButton = nullptr;

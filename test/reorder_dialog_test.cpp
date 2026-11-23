@@ -5,16 +5,20 @@
 #include <gtest/gtest.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
 #include <QTableWidget>
+#include <QTextEdit>
 
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -268,5 +272,192 @@ TEST_F(ReorderDialogTest, MovedLineColoursAreTranslucentAndDistinct)
         EXPECT_NE(color.rgb(), ReorderListingEditor::linkColor(i + 1).rgb());
     }
     EXPECT_GE(ReorderListingEditor::kLinkAlpha, 0.35);
+
+    // Lines inserted by unrolling: a light green, lighter than the move colours.
+    const QColor inserted =
+        ReorderListingEditor::linkColor(ReorderListingEditor::kInsertedColorIndex);
+    EXPECT_NEAR(inserted.alphaF(), ReorderListingEditor::kInsertedAlpha, 1e-3);
+    EXPECT_LT(inserted.alphaF(), ReorderListingEditor::kLinkAlpha);
+    EXPECT_EQ(inserted.hsvHue(), 120);
     EXPECT_LE(ReorderListingEditor::kLinkAlpha, 0.45);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opt-in loop unrolling
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+// One eligible loop (a countdown with a back-branch) that unrolling speeds up on rv5-h-nf.
+const char *kSumLoopProgram = R"(.data
+arr: .word 3, 1, 4, 1, 5, 9, 2, 6, 5, 3
+out: .word 0
+.text
+    lui x10, 65536
+    li x6, 10
+    li x7, 0
+loop:
+    lw x5, 0(x10)
+    add x7, x7, x5
+    addi x10, x10, 4
+    addi x6, x6, -1
+    bnez x6, loop
+    lui x11, 65536
+    sw x7, 40(x11)
+    li x17, 10
+    ecall
+)";
+
+// No loop at all, but a load-use pair to reorder.
+const char *kNoLoopProgram = R"(.data
+a: .word 5, 7
+.text
+    lui x10, 65536
+    lw x5, 0(x10)
+    add x6, x5, x5
+    lw x7, 4(x10)
+    addi x8, x0, 3
+    add x9, x7, x8
+    li x17, 10
+    ecall
+)";
+
+QString suggestedText(ReorderDialog &dialog)
+{
+    auto *view = dialog.findChild<ReorderListingEditor *>("suggestedView");
+    return view ? view->toPlainText() : QString();
+}
+
+QString unrollText(ReorderDialog &dialog)
+{
+    auto *label = dialog.findChild<QLabel *>("unrollLabel");
+    return label ? label->text() : QString();
+}
+
+QCheckBox *unrollCheck(ReorderDialog &dialog)
+{
+    return dialog.findChild<QCheckBox *>("unrollCheck");
+}
+} // namespace
+
+TEST_F(ReorderDialogTest, UnrollCheckboxIsOffByDefaultAndOffChangesNothing)
+{
+    for (const char *program : {kGcdProgram, kSumLoopProgram})
+    {
+        ReorderDialog untouched(nullptr, program, ProcessorType::RV5Stage_H_NF);
+        ReorderDialog toggled(nullptr, program, ProcessorType::RV5Stage_H_NF);
+        QCheckBox *check = unrollCheck(toggled);
+        ASSERT_NE(check, nullptr);
+        EXPECT_EQ(check->text(), "Also try loop unrolling");
+        EXPECT_FALSE(check->isChecked());
+        EXPECT_FALSE(unrollCheck(untouched)->isChecked());
+        check->setChecked(true);
+        check->setChecked(false);
+
+        EXPECT_EQ(suggestedText(toggled), suggestedText(untouched));
+        EXPECT_FALSE(suggestedText(untouched).contains("unroll_exit_"));
+        EXPECT_EQ(toggled.findChild<QLabel *>("legendLabel")->text(),
+                  untouched.findChild<QLabel *>("legendLabel")->text());
+        EXPECT_EQ(toggled.findChild<QPushButton *>("applyButton")->isEnabled(),
+                  untouched.findChild<QPushButton *>("applyButton")->isEnabled());
+        EXPECT_FALSE(toggled.findChild<QLabel *>("unrollLabel")->isVisibleTo(&toggled));
+        EXPECT_TRUE(unrollText(untouched).isEmpty());
+    }
+}
+
+TEST_F(ReorderDialogTest, UnrollingAnEligibleLoopShowsAndAppliesTheUnrolledProgram)
+{
+    ReorderDialog dialog(nullptr, kSumLoopProgram, ProcessorType::RV5Stage_H_NF);
+    auto *apply = dialog.findChild<QPushButton *>("applyButton");
+    ASSERT_NE(apply, nullptr);
+    unrollCheck(dialog)->setChecked(true);
+
+    const QString suggested = suggestedText(dialog);
+    EXPECT_TRUE(suggested.contains("unroll_exit_")) << suggested.toStdString();
+    const QString summary = unrollText(dialog);
+    EXPECT_TRUE(summary.contains("unrolled 1 loop")) << summary.toStdString();
+    EXPECT_TRUE(summary.contains("(original) &rarr;")) << summary.toStdString();
+    EXPECT_TRUE(summary.contains("(unrolled and reordered)")) << summary.toStdString();
+    EXPECT_TRUE(summary.contains("measured")) << summary.toStdString();
+    const QStringList legend = dialog.findChild<QLabel *>("legendLabel")->text().split('\n');
+    ASSERT_EQ(legend.size(), 4);
+    EXPECT_EQ(legend[0], "Unrolled mode shows inserted lines instead of moves.");
+    EXPECT_TRUE(apply->isEnabled());
+
+    // The inserted lines are highlighted, the exit label among them, and nothing else is.
+    auto *view = dialog.findChild<ReorderListingEditor *>("suggestedView");
+    ASSERT_NE(view, nullptr);
+    const QStringList lines = suggested.split('\n');
+    std::set<int> highlighted;
+    for (const QTextEdit::ExtraSelection &selection : view->extraSelections())
+    {
+        highlighted.insert(selection.cursor.blockNumber());
+    }
+    // Unrolling only inserts lines, so the highlighted lines are exactly the extra ones.
+    EXPECT_EQ(static_cast<qsizetype>(highlighted.size()),
+              lines.size() - QString(kSumLoopProgram).split('\n').size());
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        if (lines[i].startsWith("unroll_exit_"))
+        {
+            EXPECT_TRUE(highlighted.count(i) != 0) << lines[i].toStdString();
+        }
+    }
+
+    // The Verify verdict stays a single line.
+    const QString status = clickVerify(dialog, "");
+    EXPECT_TRUE(status.contains("Equal:")) << status.toStdString();
+    EXPECT_FALSE(status.contains("<br>")) << status.toStdString();
+    EXPECT_TRUE(apply->isEnabled());
+
+    QString applied;
+    QObject::connect(&dialog, &ReorderDialog::applyRequested,
+                     [&applied](const QString &text) { applied = text; });
+    apply->click();
+    EXPECT_EQ(applied, suggested);
+    EXPECT_TRUE(applied.contains("unroll_exit_"));
+}
+
+TEST_F(ReorderDialogTest, UnrollingWithoutALoopKeepsTheReorderOnlyResult)
+{
+    ReorderDialog plain(nullptr, kNoLoopProgram, ProcessorType::RV5Stage_H_NF);
+    ReorderDialog dialog(nullptr, kNoLoopProgram, ProcessorType::RV5Stage_H_NF);
+    unrollCheck(dialog)->setChecked(true);
+    EXPECT_EQ(suggestedText(dialog), suggestedText(plain));
+    const QString summary = unrollText(dialog);
+    EXPECT_TRUE(summary.contains(
+        "nothing kept, showing the reorder-only result: the program has no loop."))
+        << summary.toStdString();
+    EXPECT_TRUE(summary.contains("(reorder-only)")) << summary.toStdString();
+    EXPECT_EQ(dialog.findChild<QPushButton *>("applyButton")->isEnabled(),
+              plain.findChild<QPushButton *>("applyButton")->isEnabled());
+    EXPECT_TRUE(clickVerify(dialog, "").contains("Equal:"));
+}
+
+TEST_F(ReorderDialogTest, UnrollingWithATinyCycleCapFallsBack)
+{
+    ReorderDialog dialog(nullptr, kSumLoopProgram, ProcessorType::RV5Stage_H_NF);
+    auto *cap = dialog.findChild<QSpinBox *>("capSpin");
+    ASSERT_NE(cap, nullptr);
+    cap->setValue(cap->minimum());
+    unrollCheck(dialog)->setChecked(true);
+    EXPECT_FALSE(suggestedText(dialog).contains("unroll_exit_"));
+    const QString summary = unrollText(dialog);
+    EXPECT_TRUE(summary.contains("nothing kept")) << summary.toStdString();
+    EXPECT_TRUE(summary.contains("hit the cycle cap")) << summary.toStdString();
+}
+
+TEST_F(ReorderDialogTest, UnrollingWithAnInvalidSeedShowsAMessage)
+{
+    ReorderDialog dialog(nullptr, kSumLoopProgram, ProcessorType::RV5Stage_H_NF);
+    dialog.findChild<QLineEdit *>("seedEdit")->setText("garbage");
+    unrollCheck(dialog)->setChecked(true);
+    EXPECT_FALSE(suggestedText(dialog).contains("unroll_exit_"));
+    const QString summary = unrollText(dialog);
+    EXPECT_TRUE(summary.contains("not tried, invalid seed")) << summary.toStdString();
+    // A good seed afterwards unrolls.
+    dialog.findChild<QLineEdit *>("seedEdit")->setText("");
+    unrollCheck(dialog)->setChecked(false);
+    unrollCheck(dialog)->setChecked(true);
+    EXPECT_TRUE(suggestedText(dialog).contains("unroll_exit_")) << unrollText(dialog).toStdString();
 }

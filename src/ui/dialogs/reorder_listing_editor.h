@@ -44,6 +44,11 @@ public:
     // themes. Neighbouring indices get clearly different hues.
     static QColor linkColor(int colorIndex);
 
+    // Colour index for the lines added by loop unrolling: a light, more transparent green, so a
+    // run of many inserted lines stays easy to read.
+    static constexpr int kInsertedColorIndex = -1;
+    static constexpr double kInsertedAlpha = 0.18;
+
 protected:
     void changeEvent(QEvent *event) override;
 
