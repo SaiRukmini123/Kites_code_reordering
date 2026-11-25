@@ -1,3 +1,15 @@
+## Code reordering extension (CS2323 course project)
+This fork extends Kites with a tool that reorders instructions inside basic blocks to cut
+data-hazard stalls on the 5-stage pipelines, checks every change on the simulator, and can
+unroll simple loops. On 54 benchmark programs it cuts total cycles by 2.8% (with forwarding)
+and 15.0% (without), or 7.3% and 17.7% with loop unrolling, with no program slower or wrong.
+
+- Team: Peddinti Sai Rukmini (reordering library: decoder, dependency graph, cost model,
+  schedulers, safety check) and Shrestha Saanvi (evaluation, fuzz testing, loop unrolling, GUI)
+- Code: src/reorder/ (library), cli/reorder_command.cpp (command line),
+  src/ui/dialogs/ (GUI dialog), test/reorder_*_test.cpp (tests)
+- Kites itself was built by our seniors; its original README follows.
+
 # KITES : RISC - V SIMULATOR
 
 Kites a is RISC V simulator and assembly code editor built for RISC V ISA.
@@ -42,14 +54,3 @@ See [docs/TESTING.md](TESTING) for how to build and run tests, including coverag
 
 See [docs/CLI.md](docs/CLI.md) for how to build and use the headless command-line executable.
 
-## Code reordering extension (CS2323 course project)
-This fork extends Kites with a tool that reorders instructions inside basic blocks to cut
-data-hazard stalls on the 5-stage pipelines, checks every change on the simulator, and can
-unroll simple loops. On 54 benchmark programs it cuts total cycles by 2.8% (with forwarding)
-and 15.0% (without), or 7.3% and 17.7% with loop unrolling, with no program slower or wrong.
-
-- Team: Peddinti Sai Rukmini (reordering library: decoder, dependency graph, cost model,
-  schedulers, safety check) and Shrestha Saanvi (evaluation, fuzz testing, loop unrolling, GUI)
-- Code: src/reorder/ (library), cli/reorder_command.cpp (command line),
-  src/ui/dialogs/ (GUI dialog), test/reorder_*_test.cpp (tests)
-- Kites itself was built by our seniors; its original README follows.
